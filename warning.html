@@ -1,0 +1,26 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Site blocked — Phish Blocker</title>
+  <style id="warning-css">
+    body { font-family: Arial, sans-serif; padding: 20px; max-width:760px; }
+    h1 { color: #b22222; margin-bottom:6px; }
+    .reason { margin: 12px 0; padding: 12px; background:#fff0f0; border: 1px solid #f5c2c7; white-space:pre-wrap; }
+    .controls { margin-top: 18px; }
+    button { margin-right: 8px; padding: 8px 12px; }
+    .muted { color:#666; font-size:13px; margin-top:8px; }
+  </style>
+</head>
+<body>
+  <h1>Navigation paused — suspicious site</h1>
+  <div id="details" class="reason"></div>
+  <div class="controls">
+    <button id="proceed">Proceed anyway</button>
+    <button id="closeTab">Close tab</button>
+    <button id="allowAndProceed">Allow this host and proceed</button>
+  </div>
+  <div class="muted">This extension inspected the URL before loading and flagged it using a local heuristic or blocklist.</div>
+  <script src="warning.js"></script>
+</body>
+</html>

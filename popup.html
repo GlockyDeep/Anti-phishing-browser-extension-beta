@@ -1,0 +1,88 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Phish Blocker</title>
+  <style>
+    body { font-family: Arial, sans-serif; width: 320px; padding: 12px; }
+    label { display:flex; align-items:center; gap:8px; }
+    #allowlist { font-size: 12px; margin-top: 8px; max-height: 120px; overflow:auto; border:1px solid #eee; padding:6px; background:#fafafa; }
+    button { margin-top: 8px; }
+    .host-row { display:flex; justify-content:space-between; gap:8px; padding:4px 0; border-bottom:1px solid #f0f0f0; }
+    .small { font-size:12px; color:#666; margin-top:8px; }
+    .api-input { width:100%; box-sizing:border-box; padding:6px; margin-top:6px; font-family:monospace; }
+    .warning { color:#b22222; font-size:12px; margin-top:6px; }
+
+    /* Modal styles */
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.5);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 9999;
+    }
+    .modal {
+      background: #fff;
+      padding: 16px;
+      width: 90%;
+      max-width: 420px;
+      border-radius: 6px;
+      box-shadow: 0 6px 24px rgba(0,0,0,0.2);
+    }
+    .modal h4 { margin: 0 0 8px 0; }
+    .modal p { margin: 8px 0; color: #333; font-size: 13px; white-space: pre-wrap; }
+    .modal .actions { margin-top: 12px; text-align: right; }
+    .btn { padding: 8px 12px; margin-left: 8px; cursor: pointer; border-radius: 4px; border: none; }
+    .btn-muted { background: #f0f0f0; color: #333; }
+    .btn-danger { background: #d9534f; color: #fff; }
+    .btn-primary { background: #007bff; color: #fff; }
+  </style>
+</head>
+<body>
+  <h3>PreVisit Phish Blocker</h3>
+  <label><input id="toggle" type="checkbox" /> Enabled</label>
+
+  <div style="margin-top:10px;">
+    <label><input id="useCloud" type="checkbox" /> Use cloud lookup (Safe Browsing proxy)</label>
+    <div class="small">Run the proxy at <code>http://localhost:3000</code> and enable this option.</div>
+  </div>
+
+  <div style="margin-top:10px;">
+    <label><input id="useDirect" type="checkbox" /> Use direct lookup (embed API key)</label>
+    <div class="small">Quick prototype only — this stores your API key locally (not secure).</div>
+    <input id="apiKey" class="api-input" type="password" placeholder="Paste Safe Browsing API key here" />
+    <div class="warning">Do NOT publish the extension with a real API key. Revoke the key after testing.</div>
+  </div>
+
+  <div style="margin-top:10px;">
+    <button id="allowCurrent">Allow current site</button>
+  </div>
+
+  <div style="margin-top:8px;">
+    <strong>Allowlist</strong>
+    <div id="allowlist">(none)</div>
+  </div>
+
+  <div class="small">Prototype: local blocklist + optional proxy or direct cloud checks.</div>
+
+  <!-- Confirmation modal for direct-lookup -->
+  <div id="directWarningModal" class="modal-overlay" role="dialog" aria-modal="true" aria-hidden="true">
+    <div class="modal" role="document">
+      <h4>Confirm direct lookup</h4>
+      <p>
+Enabling direct lookup will store your Google Safe Browsing API key in your browser's local storage.
+This is only for quick testing or demos. Storing the key locally can expose it to anyone with access to your machine or to anyone who inspects the extension files. Do NOT publish or share this key.
+      </p>
+      <p style="font-weight:600;">Do you understand and wish to proceed?</p>
+      <div class="actions">
+        <button id="cancelDirectBtn" class="btn btn-muted">Cancel</button>
+        <button id="confirmDirectBtn" class="btn btn-primary">I understand — enable</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

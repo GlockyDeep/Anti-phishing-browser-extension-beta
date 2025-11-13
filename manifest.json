@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "PreVisit Phish Blocker (Prototype)",
+  "version": "0.1.1",
+  "description": "Prototype: check URLs before navigation and warn on suspicious sites (local-first) with optional Safe Browsing proxy.",
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": [
+    "storage",
+    "tabs",
+    "webNavigation"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Phish Blocker"
+  },
+  "icons": {
+    "48": "icons/icon48.svg",
+    "128": "icons/icon128.svg"
+  },
+  "host_permissions": [
+    "<all_urls>",
+    "http://localhost:3000/*"
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["warning.html", "warning.js"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
