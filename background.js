@@ -1,42 +1,74 @@
-// background.js - MV3 service worker with host-only logging to proxy
-// Now extracts hostname only and sends that to the proxy/log endpoint (no path/query).
-// WARNING: logs are still sensitive (hostnames visited). Keep enabled only for testing.
+// background.js - MV3 service worker with hover-check handler and host-only logging
+// Integrates heuristics, proxy/direct checks, navigation interception, and CHECK_URL_HOVER message.
 
 const SUSPICIOUS_TLDS = ['tk','ml','ga','cf','gq'];
 let blocklist = [];
 let enabled = true;
 let allowlist = [];
-let useCloudLookup = false; // persisted in storage
-let useDirectLookup = false;
-let directApiKey = '';
+let useCloudLookup = false;   // proxy
+let useDirectLookup = false;  // direct API (insecure)
+let directApiKey = '';        // stored in chrome.storage.local when user supplies it
 
-const PROXY_LOG_ENDPOINT = 'http://localhost:3000/log';
+const PROXY_CHECK_BASE = 'http://localhost:3000';
+const PROXY_LOG_ENDPOINT = PROXY_CHECK_BASE + '/log';
 
-function logSW(...args) { console.log('[PreVisit SW]', ...args); }
-function warnSW(...args) { console.warn('[PreVisit SW]', ...args); }
-function errorSW(...args) { console.error('[PreVisit SW]', ...args); }
+// Hover cache
+const HOVER_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+const hoverCache = new Map(); // url -> { status, reason, ts }
+
+// Simple logging helpers
+function logSW(...args) { console.log('[Anti-Phish Guard SW]', ...args); }
+function warnSW(...args) { console.warn('[Anti-Phish Guard SW]', ...args); }
+function errorSW(...args) { console.error('[Anti-Phish Guard SW]', ...args); }
 
 async function loadState() {
+  logSW('loadState: start');
   try {
-    const s = await chrome.storage.local.get(['enabled','allowlist','useCloudLookup','useDirectLookup','directApiKey']);
-    enabled = s.enabled !== undefined ? s.enabled : true;
-    allowlist = s.allowlist || [];
-    useCloudLookup = s.useCloudLookup || false;
-    useDirectLookup = s.useDirectLookup || false;
-    directApiKey = s.directApiKey || '';
-    const resp = await fetch(chrome.runtime.getURL('blocklist.json'));
-    blocklist = await resp.json();
-    logSW('state loaded', { enabled, allowlistLen: allowlist.length, useCloudLookup, useDirectLookup });
+    if (!chrome || !chrome.storage || !chrome.storage.local || !chrome.storage.local.get) {
+      warnSW('chrome.storage.local not available — using defaults');
+      enabled = true;
+      allowlist = [];
+      useCloudLookup = false;
+      useDirectLookup = false;
+      directApiKey = '';
+    } else {
+      const s = await chrome.storage.local.get(['enabled','allowlist','useCloudLookup','useDirectLookup','directApiKey']);
+      enabled = s.enabled !== undefined ? s.enabled : true;
+      allowlist = s.allowlist || [];
+      useCloudLookup = s.useCloudLookup || false;
+      useDirectLookup = s.useDirectLookup || false;
+      directApiKey = s.directApiKey || '';
+      logSW('loadState: storage loaded', { enabled, allowlistLen: allowlist.length, useCloudLookup, useDirectLookup });
+    }
+
+    // load packaged blocklist if present
+    try {
+      const resp = await fetch(chrome.runtime.getURL('blocklist.json'));
+      if (resp.ok) {
+        blocklist = await resp.json();
+        logSW('blocklist loaded, entries=', blocklist.length);
+      } else {
+        logSW('no packaged blocklist or fetch non-OK', resp.status);
+        blocklist = [];
+      }
+    } catch (e) {
+      warnSW('failed to load blocklist.json', e);
+      blocklist = [];
+    }
   } catch (e) {
-    warnSW('loadState failed, using defaults', e);
+    warnSW('loadState failed, applying defaults', e);
     enabled = true;
     allowlist = [];
     useCloudLookup = false;
     useDirectLookup = false;
+    directApiKey = '';
     blocklist = [];
+  } finally {
+    logSW('loadState: finished');
   }
 }
 
+// heuristics: return reason string if suspicious, otherwise null
 function runHeuristics(urlStr) {
   try {
     const u = new URL(urlStr);
@@ -58,22 +90,23 @@ function runHeuristics(urlStr) {
       }
     }
   } catch (e) {
-    warnSW('heuristic parse failed', e);
+    warnSW('runHeuristics parse failed for', urlStr, e);
   }
   return null;
 }
 
+// Call local proxy check
 async function checkWithProxy(url) {
   try {
     const encoded = encodeURIComponent(url);
-    const resp = await fetch(`http://localhost:3000/check?url=${encoded}`, { method: 'GET' });
+    const resp = await fetch(`${PROXY_CHECK_BASE}/check?url=${encoded}`, { method: 'GET' });
     if (!resp.ok) {
-      warnSW('Proxy lookup failed', resp.status);
+      warnSW('Proxy lookup non-OK', resp.status);
       return null;
     }
     const json = await resp.json();
     if (json.safe === false) {
-      return 'Matches Google Safe Browsing (proxy) or feed';
+      return 'Matches proxy (Safe Browsing / feeds)';
     }
     return null;
   } catch (e) {
@@ -82,10 +115,11 @@ async function checkWithProxy(url) {
   }
 }
 
+// Direct Safe Browsing (insecure when key stored client-side)
 async function checkWithSafeBrowsingDirect(apiKey, url) {
   if (!apiKey) return null;
   const body = {
-    client: { clientId: 'previsit-ext', clientVersion: '1.0.0' },
+    client: { clientId: 'antiphish-guard', clientVersion: '1.0.0' },
     threatInfo: {
       threatTypes: [
         'MALWARE',
@@ -115,36 +149,98 @@ async function checkWithSafeBrowsingDirect(apiKey, url) {
     }
     return null;
   } catch (e) {
-    warnSW('Safe Browsing direct lookup error', e);
+    warnSW('Safe Browsing direct error', e);
     return null;
   }
 }
 
-// send navigation log to proxy /log — host-only
+// Host-only logging to proxy (best-effort)
 async function sendLogToProxyHostOnly(logObj) {
   try {
-    // Ensure we send only the host field
     const payload = {
       timestamp: logObj.timestamp,
       tabId: logObj.tabId,
-      host: logObj.host,            // host only
+      host: logObj.host,
       blocked: !!logObj.blocked,
       reason: logObj.reason || '',
       heuristicsOnly: !!logObj.heuristicsOnly,
       extra: logObj.extra || null
     };
-    // best effort; do not block navigation on logging
     await fetch(PROXY_LOG_ENDPOINT, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
   } catch (e) {
-    // ignore logging errors but print SW console
+    // ignore but log locally
     warnSW('sendLogToProxyHostOnly failed', e);
   }
 }
 
+// hover cache helpers
+function getHoverCached(url) {
+  const v = hoverCache.get(url);
+  if (!v) return null;
+  if (Date.now() - v.ts > HOVER_CACHE_TTL) { hoverCache.delete(url); return null; }
+  return v;
+}
+function setHoverCached(url, status, reason) {
+  hoverCache.set(url, { status, reason, ts: Date.now() });
+}
+
+// Message handler for hover checks
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!msg || msg.type !== 'CHECK_URL_HOVER') return;
+  (async () => {
+    const url = msg.url;
+    if (!url) { sendResponse({ status: 'unknown', reason: 'no url' }); return; }
+
+    const cached = getHoverCached(url);
+    if (cached) {
+      sendResponse({ status: cached.status, reason: cached.reason, cached: true });
+      return;
+    }
+
+    // Local heuristics first
+    try {
+      let reason = runHeuristics(url);
+      if (reason) {
+        setHoverCached(url, 'unsafe', reason);
+        sendResponse({ status: 'unsafe', reason });
+        return;
+      }
+
+      // Only call proxy on hover if cloud lookup is enabled (avoid network flood)
+      if (useCloudLookup) {
+        const cloudReason = await checkWithProxy(url);
+        if (cloudReason) {
+          setHoverCached(url, 'unsafe', cloudReason);
+          sendResponse({ status: 'unsafe', reason: cloudReason });
+          return;
+        }
+      }
+
+      // Optionally direct lookup if enabled
+      if (useDirectLookup && directApiKey) {
+        const directReason = await checkWithSafeBrowsingDirect(directApiKey, url);
+        if (directReason) {
+          setHoverCached(url, 'unsafe', directReason);
+          sendResponse({ status: 'unsafe', reason: directReason });
+          return;
+        }
+      }
+
+      // safe
+      setHoverCached(url, 'safe', '');
+      sendResponse({ status: 'safe' });
+    } catch (e) {
+      sendResponse({ status: 'unknown', reason: e && e.message ? e.message : String(e) });
+    }
+  })();
+  return true; // indicates we'll call sendResponse asynchronously
+});
+
+// Navigation interception: run heuristics and proxy/direct checks, then redirect to warning page when needed
 async function onBeforeNavigate(details) {
   try {
     if (details.frameId !== 0) return;
@@ -152,31 +248,36 @@ async function onBeforeNavigate(details) {
     if (!details.url) return;
     if (details.url.startsWith(chrome.runtime.getURL('warning.html'))) return;
 
-    // Extract host only
-    let hostOnly = '<invalid-host>';
-    try { hostOnly = new URL(details.url).hostname.toLowerCase(); } catch (e) { /* leave placeholder */ }
+    logSW('onBeforeNavigate', details.url, 'tab=' + details.tabId);
 
-    logSW('onBeforeNavigate host=', hostOnly, 'tabId=' + details.tabId);
-
-    // run local heuristics using full url but reasons are host-related; keep heuristics unchanged
     let reason = runHeuristics(details.url);
 
     if (!reason && useCloudLookup) {
-      const cloudReason = await checkWithProxy(details.url);
-      if (cloudReason) reason = cloudReason;
+      try {
+        const cloudReason = await checkWithProxy(details.url);
+        if (cloudReason) reason = cloudReason;
+      } catch (e) {
+        warnSW('cloud lookup failed', e);
+      }
     }
 
-    if (!reason && useDirectLookup && directApiKey) {
-      const directReason = await checkWithSafeBrowsingDirect(directApiKey, details.url);
-      if (directReason) reason = directReason;
+    if (!reason && useDirectLookup) {
+      try {
+        const directReason = await checkWithSafeBrowsingDirect(directApiKey, details.url);
+        if (directReason) reason = directReason;
+      } catch (e) {
+        warnSW('direct lookup failed', e);
+      }
     }
 
     const blocked = !!reason;
-
-    // Log to SW console host-only
+    // host-only for logging
+    let hostOnly = '<invalid-host>';
+    try { hostOnly = new URL(details.url).hostname.toLowerCase(); } catch (e) {}
+    // Log to SW console
     logSW('NAV HOST LOG', { ts: new Date().toISOString(), tabId: details.tabId, host: hostOnly, blocked, reason });
 
-    // Send host-only to proxy (best-effort)
+    // Best-effort: send host-only to proxy
     sendLogToProxyHostOnly({
       timestamp: new Date().toISOString(),
       tabId: details.tabId,
@@ -192,20 +293,26 @@ async function onBeforeNavigate(details) {
         `?url=${encodeURIComponent(details.url)}&reason=${encodeURIComponent(reason)}`;
       try {
         await chrome.tabs.update(details.tabId, { url: warningUrl });
-      } catch (tabErr) {
-        errorSW('chrome.tabs.update failed', tabErr);
+      } catch (e) {
+        errorSW('chrome.tabs.update failed', e);
       }
     }
-  } catch (err) {
-    errorSW('onBeforeNavigate unexpected error', err);
+  } catch (e) {
+    errorSW('onBeforeNavigate unexpected', e);
   }
 }
 
-chrome.webNavigation.onBeforeNavigate.addListener(
-  onBeforeNavigate,
-  { url: [{ schemes: ['http','https'] }] }
-);
+// Register navigation listener
+try {
+  chrome.webNavigation.onBeforeNavigate.addListener(
+    onBeforeNavigate,
+    { url: [{ schemes: ['http','https'] }] }
+  );
+} catch (e) {
+  warnSW('Failed to register webNavigation listener', e);
+}
 
+// storage change listener
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local') {
     if (changes.enabled) enabled = changes.enabled.newValue;
@@ -213,9 +320,31 @@ chrome.storage.onChanged.addListener((changes, area) => {
     if (changes.useCloudLookup) useCloudLookup = changes.useCloudLookup.newValue || false;
     if (changes.useDirectLookup) useDirectLookup = changes.useDirectLookup.newValue || false;
     if (changes.directApiKey) directApiKey = changes.directApiKey.newValue || '';
+    logSW('storage.onChanged updated', { enabled, allowlistLen: allowlist.length, useCloudLookup, useDirectLookup });
   }
 });
 
 // initialize
-loadState();
-chrome.runtime.onInstalled.addListener(loadState);
+(async () => {
+  try {
+    logSW('Service worker starting up');
+    await loadState();
+    logSW('Service worker initialized');
+  } catch (e) {
+    errorSW('Service worker startup failed', e);
+  }
+})();
+
+// Expose debugDump for SW console
+self.debugDump = async function() {
+  try {
+    const s = chrome && chrome.storage ? await chrome.storage.local.get(null) : {};
+    console.log('[Anti-Phish Guard SW] debugDump storage:', s);
+    console.log('[Anti-Phish Guard SW] blocklist len:', blocklist.length);
+    console.log('[Anti-Phish Guard SW] hoverCache size:', hoverCache.size);
+    return { storage: s, blocklistLen: blocklist.length, hoverCacheSize: hoverCache.size };
+  } catch (e) {
+    console.warn('[Anti-Phish Guard SW] debugDump failed', e);
+    return { storage: null, blocklistLen: blocklist.length, hoverCacheSize: hoverCache.size };
+  }
+};

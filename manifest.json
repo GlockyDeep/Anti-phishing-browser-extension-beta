@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
-  "name": "PreVisit Phish Blocker (Prototype)",
-  "version": "0.1.1",
+  "name": "Anti-Phish Guard",
+  "version": "0.1.2",
   "description": "Prototype: check URLs before navigation and warn on suspicious sites (local-first) with optional Safe Browsing proxy.",
   "background": {
     "service_worker": "background.js"
@@ -13,12 +13,19 @@
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Phish Blocker"
+    "default_title": "Anti-Phish Guard"
   },
   "icons": {
     "48": "icons/icon48.svg",
     "128": "icons/icon128.svg"
   },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content_script.js"],
+      "run_at": "document_idle"
+    }
+  ],
   "host_permissions": [
     "<all_urls>",
     "http://localhost:3000/*"

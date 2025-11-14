@@ -1,11 +1,15 @@
 // server.js
-// Safe Browsing proxy + URLhaus checks with host-only logging (no paths/queries).
+// Safe Browsing proxy + OpenPhish feed fetching + local URLhaus hostlist (NO writing/rewriting local URLhaus file).
 //
-// Usage (local demo):
-//   NODE_API_KEY=YOUR_GOOGLE_KEY [PHISHTANK_API_KEY=YOUR_KEY] node server.js
+// Changes versus previous version:
+// - Do NOT write merged hosts back to server/data/urlhaus_hosts.txt (we only read the local file).
+// - UpdateFeeds fetches OpenPhish and reads local URLhaus file, merges into in-memory set only.
+// - Less noisy logging around feed persistence (no "Wrote merged hosts").
 //
-// It expects server/data/urlhaus_hosts.txt to exist (one hostname per line).
-// You can create that with: node update_urlhaus.js
+// Usage:
+//   NODE_API_KEY=YOUR_GOOGLE_KEY node server.js
+// Optional:
+//   PHISHTANK_API_KEY=YOUR_PHISHTANK_KEY node server.js
 
 const express = require('express');
 const fetch = require('node-fetch');
@@ -20,14 +24,11 @@ if (!API_KEY) {
   process.exit(1);
 }
 
-// Simple in-memory cache: key -> { safe: boolean, matches: object|null, ts }
-const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
-const cache = new Map();
+const DATA_DIR = path.join(__dirname, 'data');
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-// URLhaus hosts data
-const URLHAUS_HOSTS_PATH = path.join(__dirname, 'data', 'urlhaus_hosts.txt');
-let urlhausSet = new Set();
-let urlhausLastLoaded = 0;
+const URLHAUS_HOSTS_PATH = path.join(DATA_DIR, 'urlhaus_hosts.txt'); // local file only (read-only)
+const OPENPHISH_URL = 'https://openphish.com/feed.txt';
 
 function setCorsHeaders(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -35,49 +36,116 @@ function setCorsHeaders(res) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 }
 
-// parse JSON bodies for POST /log
 app.use(express.json({ limit: '64kb' }));
 
-function loadUrlhausHosts() {
+// Simple in-memory cache and config
+const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes for check results
+const cache = new Map();
+let feedHostSet = new Set();
+let feedsLastLoaded = 0;
+
+const FEED_UPDATE_INTERVAL_MS = 10 * 60 * 1000; // refresh every 10 minutes (OpenPhish only)
+let lastFeedUpdateTs = 0;
+
+// Helper: extract hostname from a URL string
+function hostnameFromUrl(urlStr) {
   try {
-    if (!fs.existsSync(URLHAUS_HOSTS_PATH)) {
-      console.warn('URLhaus hosts file not found at', URLHAUS_HOSTS_PATH);
-      urlhausSet = new Set();
-      urlhausLastLoaded = Date.now();
-      return;
-    }
-    const txt = fs.readFileSync(URLHAUS_HOSTS_PATH, 'utf8');
-    const lines = txt.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-    urlhausSet = new Set(lines);
-    urlhausLastLoaded = Date.now();
-    console.log(`Loaded urlhaus hosts: ${urlhausSet.size} entries from ${URLHAUS_HOSTS_PATH}`);
+    return new URL(urlStr).hostname.toLowerCase();
   } catch (e) {
-    console.warn('Failed to load urlhaus hosts', e);
-    urlhausSet = new Set();
+    return null;
   }
 }
 
-// helper to check host and suffixes (so sub.example.com triggers example.com if present)
+// Fetch OpenPhish feed (plain text, one URL per line)
+async function fetchOpenPhishFeed() {
+  try {
+    const resp = await fetch(OPENPHISH_URL, { method: 'GET' });
+    if (!resp.ok) {
+      console.warn('OpenPhish fetch non-OK', resp.status);
+      return [];
+    }
+    const txt = await resp.text();
+    const lines = txt.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    const hosts = lines.map(hostnameFromUrl).filter(Boolean);
+    return hosts;
+  } catch (err) {
+    console.warn('OpenPhish fetch failed', err);
+    return [];
+  }
+}
+
+// Read local URLhaus hosts (no network). Returns array of hosts.
+function readLocalUrlhausHosts() {
+  try {
+    if (!fs.existsSync(URLHAUS_HOSTS_PATH)) return [];
+    const txt = fs.readFileSync(URLHAUS_HOSTS_PATH, 'utf8');
+    const lines = txt.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    return lines.map(h => h.toLowerCase());
+  } catch (e) {
+    console.warn('Failed to read local urlhaus hosts file', e);
+    return [];
+  }
+}
+
+// Update feeds: fetch OpenPhish, load local URLhaus file, merge into in-memory set.
+// IMPORTANT: This function does NOT write the merged hosts back to disk.
+async function updateFeeds() {
+  try {
+    console.log('[Proxy] Updating OpenPhish and reloading local URLhaus hosts (read-only)...');
+    const now = Date.now();
+
+    // fetch OpenPhish
+    const openHosts = await fetchOpenPhishFeed();
+
+    // read local URLhaus hosts file (if present)
+    const localUrlhausHosts = readLocalUrlhausHosts();
+
+    // merge into in-memory set only
+    const merged = new Set();
+    for (const h of openHosts) merged.add(h);
+    for (const h of localUrlhausHosts) merged.add(h);
+
+    feedHostSet = new Set(Array.from(merged));
+    feedsLastLoaded = Date.now();
+    lastFeedUpdateTs = Date.now();
+
+    console.log(`[Proxy] Feeds updated: OpenPhish ${openHosts.length}, local URLhaus ${localUrlhausHosts.length}, total hosts ${feedHostSet.size}`);
+    return { ok: true, openphish: openHosts.length, localUrlhaus: localUrlhausHosts.length, total: feedHostSet.size };
+  } catch (err) {
+    console.warn('[Proxy] updateFeeds failed', err);
+    return { ok: false, error: err && err.message ? err.message : String(err) };
+  }
+}
+
+// Kick off initial update and periodic refresh (OpenPhish only)
+(async () => {
+  try {
+    await updateFeeds();
+  } catch (e) {
+    console.warn('Initial feed update failed', e);
+  }
+})();
+setInterval(() => {
+  updateFeeds().catch(e => console.warn('Scheduled feed update failed', e));
+}, FEED_UPDATE_INTERVAL_MS);
+
+// helper to check host in set with suffix matching
 function findMatchingHostInSet(host) {
   if (!host) return null;
   host = host.toLowerCase();
-  if (urlhausSet.has(host)) return host;
+  if (feedHostSet.has(host)) return host;
   const parts = host.split('.');
   for (let i = 0; i < parts.length - 1; i++) {
     const suffix = parts.slice(i).join('.');
-    if (urlhausSet.has(suffix)) return suffix;
+    if (feedHostSet.has(suffix)) return suffix;
   }
   return null;
 }
 
-// initial load and periodic reload
-loadUrlhausHosts();
-setInterval(loadUrlhausHosts, 10 * 60 * 1000);
-
 // -- Safe Browsing body builder --
 function buildSafeBrowsingBody(url) {
   return {
-    client: { clientId: 'previsit-ext', clientVersion: '1.0.0' },
+    client: { clientId: 'antiphish-guard', clientVersion: '1.0.0' },
     threatInfo: {
       threatTypes: [
         'MALWARE',
@@ -113,20 +181,35 @@ async function checkPhishTank(url) {
       return { error: `non-OK ${ptResp.status}` };
     }
     const ptJson = await ptResp.json();
-    const ptResults = ptJson.results || null;
-    return ptResults;
+    return ptJson.results || null;
   } catch (err) {
     console.warn('PhishTank request failed', err);
     return { error: err && err.message ? err.message : String(err) };
   }
 }
 
-// POST /log - receive navigation logs from the extension and print host-only to console
+// POST /refresh-feeds - manual trigger to refresh OpenPhish and reload local URLhaus file (read-only)
+app.post('/refresh-feeds', async (req, res) => {
+  setCorsHeaders(res);
+  try {
+    const now = Date.now();
+    // Avoid extremely frequent manual refreshes (2s)
+    if ((now - lastFeedUpdateTs) < 2000) {
+      return res.json({ ok: false, reason: 'rate_limited', lastUpdateMsAgo: now - lastFeedUpdateTs });
+    }
+    const r = await updateFeeds();
+    return res.json(r);
+  } catch (e) {
+    console.warn('Manual refresh failed', e);
+    return res.status(500).json({ ok: false, error: e && e.message ? e.message : String(e) });
+  }
+});
+
+// POST /log - receive navigation logs and print host-only to console
 app.post('/log', (req, res) => {
   setCorsHeaders(res);
   try {
     const body = req.body || {};
-    // Accept either host field (preferred) or url and derive host; always store/print only the host
     let host = null;
     if (body.host) {
       host = String(body.host).toLowerCase();
@@ -143,7 +226,6 @@ app.post('/log', (req, res) => {
     const heuristicsOnly = !!body.heuristicsOnly;
     const extra = body.extra || null;
 
-    // Compose a readable log line but only include host (no path/query)
     const parts = [
       `[NAV] ${ts}`,
       `tab=${tabId}`,
@@ -155,12 +237,12 @@ app.post('/log', (req, res) => {
     ].filter(Boolean).join(' | ');
 
     console.log(parts);
-    // Optionally append to server/data/navigation_hosts.log (host-only)
+    // append host-only to navigation_hosts.log
     try {
-      const logPath = path.join(__dirname, 'data', 'navigation_hosts.log');
+      const logPath = path.join(DATA_DIR, 'navigation_hosts.log');
       fs.appendFileSync(logPath, parts + '\n', 'utf8');
     } catch (e) {
-      // ignore file errors
+      // ignore
     }
 
     res.json({ ok: true });
@@ -170,7 +252,7 @@ app.post('/log', (req, res) => {
   }
 });
 
-// main /check endpoint
+// GET /check?url=...
 app.options('/check', (req, res) => {
   setCorsHeaders(res);
   res.sendStatus(204);
@@ -191,8 +273,10 @@ app.get('/check', async (req, res) => {
     return res.json({ safe: c.safe, matches: c.matches, cached: true });
   }
 
-  // 1) Quick local check: URLhaus hostlist
-  let combinedMatches = { urlhaus: null, safebrowsing: null, phishtank: null };
+  let combinedMatches = { feeds: null, safebrowsing: null, phishtank: null };
+  let safe = true;
+
+  // 1) Quick local check: merged feeds (OpenPhish + local URLhaus in-memory)
   try {
     const host = (() => {
       try { return new URL(url).hostname.toLowerCase(); } catch (e) { return null; }
@@ -201,17 +285,17 @@ app.get('/check', async (req, res) => {
     if (host) {
       const matchedHost = findMatchingHostInSet(host);
       if (matchedHost) {
-        combinedMatches.urlhaus = { matchedHost };
-        const safe = false;
+        combinedMatches.feeds = { matchedHost, source: 'feeds' };
+        safe = false;
         cache.set(key, { safe, matches: combinedMatches, ts: Date.now() });
         return res.json({ safe, matches: combinedMatches, cached: false });
       }
     }
   } catch (e) {
-    console.warn('Local urlhaus check failed', e);
+    console.warn('Local feeds check failed', e);
   }
 
-  // 2) Safe Browsing lookup
+  // 2) Google Safe Browsing
   try {
     const resp = await fetch(`https://safebrowsing.googleapis.com/v4/threatMatches:find?key=${API_KEY}`, {
       method: 'POST',
@@ -227,7 +311,7 @@ app.get('/check', async (req, res) => {
     const sbMatches = j.matches || null;
     combinedMatches.safebrowsing = sbMatches;
     if (sbMatches) {
-      const safe = false;
+      safe = false;
       cache.set(key, { safe, matches: combinedMatches, ts: Date.now() });
       return res.json({ safe, matches: combinedMatches, cached: false });
     }
@@ -236,32 +320,37 @@ app.get('/check', async (req, res) => {
     return res.status(500).json({ error: 'safe browsing lookup failed' });
   }
 
-  // 3) Optional PhishTank lookup
+  // 3) Optional PhishTank
   if (PHISHTANK_KEY) {
     try {
       const pt = await checkPhishTank(url);
       combinedMatches.phishtank = pt;
       if (pt && pt.in_database && pt.valid) {
-        const safe = false;
+        safe = false;
         cache.set(key, { safe, matches: combinedMatches, ts: Date.now() });
         return res.json({ safe, matches: combinedMatches, cached: false });
       }
     } catch (e) {
       console.warn('PhishTank check failed', e);
-      // continue; we consider phishtank optional
     }
   }
 
-  // If no matches -> safe
-  const safe = true;
+  // no matches -> safe
   cache.set(key, { safe, matches: combinedMatches, ts: Date.now() });
   return res.json({ safe, matches: combinedMatches, cached: false });
 });
 
+// Health endpoint
 app.get('/health', (req, res) => {
   setCorsHeaders(res);
-  res.json({ ok: true, urlhausLoadedAt: urlhausLastLoaded || null, urlhausCount: urlhausSet.size, phishtankConfigured: !!PHISHTANK_KEY });
+  res.json({
+    ok: true,
+    phishtankConfigured: !!PHISHTANK_KEY,
+    feedsCount: feedHostSet.size,
+    feedsLoadedAt: feedsLastLoaded || null,
+    lastFeedUpdateMsAgo: Date.now() - (lastFeedUpdateTs || 0)
+  });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`SafeBrowsing proxy listening on http://localhost:${PORT} (URLhaus hosts: ${urlhausSet.size})`));
+app.listen(PORT, () => console.log(`SafeBrowsing proxy listening on http://localhost:${PORT} (feeds loaded: ${feedHostSet.size})`));
