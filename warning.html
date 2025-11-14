@@ -5,153 +5,33 @@
   <title>Anti-Phish Guard — Navigation paused</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
-    :root{
-      --bg-red: #8b0000; /* dim red background */
-      --card-bg: rgba(255,255,255,0.06);
-      --muted: rgba(255,255,255,0.85);
-      --accent-yellow: #f59e0b; /* yellow allow button */
-      --danger: #ff5757;
-      --radius: 10px;
-      --pad: 18px;
-      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
-    }
-    html,body{
-      height:100%;
-      margin:0;
-      background: var(--bg-red);
-      color: white;
-      -webkit-font-smoothing:antialiased;
-      -moz-osx-font-smoothing:grayscale;
-    }
-    .wrap{
-      min-height:100%;
-      display:flex;
-      align-items:center;
-      justify-content:center;
-      padding:32px;
-      box-sizing:border-box;
-    }
-    .card{
-      width:100%;
-      max-width:820px;
-      background: rgba(0,0,0,0.18);
-      border-radius:12px;
-      padding:20px;
-      box-shadow: 0 10px 30px rgba(0,0,0,0.35);
-      border: 1px solid rgba(255,255,255,0.06);
-    }
-    header{
-      display:flex;
-      align-items:center;
-      gap:14px;
-    }
-    header img{ width:44px; height:44px; border-radius:8px; background:rgba(255,255,255,0.06); }
-    h1{
-      margin:0;
-      font-size:20px;
-      color:#fff; /* explicitly white per request */
-      letter-spacing:0.2px;
-    }
-    .sub{
-      margin-top:6px;
-      color: rgba(255,255,255,0.9);
-      font-size:13px;
-    }
-    .reason{
-      margin-top:18px;
-      background: var(--card-bg);
-      padding:12px;
-      border-radius:8px;
-      color: #fff;
-      font-size:14px;
-      line-height:1.35;
-      border:1px solid rgba(255,255,255,0.04);
-    }
-    .meta{
-      margin-top:12px;
-      color: rgba(255,255,255,0.8);
-      font-size:13px;
-    }
-    .actions{
-      margin-top:18px;
-      display:flex;
-      gap:10px;
-      align-items:center;
-    }
-    button {
-      border: none;
-      padding:10px 14px;
-      border-radius:8px;
-      font-size:14px;
-      cursor:pointer;
-    }
-    .btn-close {
-      background: rgba(255,255,255,0.08);
-      color: white;
-    }
-    .btn-allow {
-      background: var(--accent-yellow);
-      color: #111;
-      font-weight:600;
-    }
-    .note{
-      margin-top:10px;
-      color: rgba(255,255,255,0.85);
-      font-size:12px;
-    }
-    a.help {
-      color: rgba(255,255,255,0.95);
-      text-decoration: underline;
-    }
-    footer {
-      margin-top:14px;
-      font-size:12px;
-      color: rgba(255,255,255,0.8);
-    }
-    @media (max-width:480px){
-      .card { padding:14px; }
-      h1 { font-size:18px; }
-    }
+    :root{--bg-red:#8b0000;--accent-yellow:#f59e0b}
+    html,body{height:100%;margin:0;background:var(--bg-red);color:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial}
+    .wrap{min-height:100%;display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box}
+    .card{max-width:820px;background:rgba(0,0,0,0.18);padding:20px;border-radius:12px}
+    h1{margin:0;font-size:20px;color:#fff}
+    .reason{margin-top:12px;background:rgba(255,255,255,0.06);padding:12px;border-radius:8px}
+    .meta{margin-top:8px;color:rgba(255,255,255,0.9)}
+    .actions{margin-top:12px;display:flex;gap:10px}
+    button{padding:8px 12px;border-radius:8px;border:none;cursor:pointer}
+    .btn-allow{background:var(--accent-yellow);color:#111;font-weight:600}
+    .btn-close{background:rgba(255,255,255,0.08);color:#fff}
+    .source{margin-top:8px;font-size:13px;color:rgba(255,255,255,0.95)}
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="card" role="dialog" aria-labelledby="heading" aria-describedby="reason">
-      <header>
-        <img src="icons/icon128.svg" alt="Anti-Phish Guard">
-        <div>
-          <h1 id="heading">Navigation is paused</h1>
-          <div class="sub">This site looks suspicious — we stopped navigation to protect you.</div>
-        </div>
-      </header>
-
-      <div id="reason" class="reason" aria-live="polite">
-        <strong>Reason:</strong>
-        <div id="reasonText">Checking...</div>
-      </div>
-
-      <div class="meta">
-        <div><strong>Destination:</strong> <span id="destHost">—</span></div>
-        <div id="destFull" style="margin-top:6px;font-size:13px;color:rgba(255,255,255,0.85);word-break:break-all;"></div>
-      </div>
-
+      <h1 id="heading">Navigation is paused</h1>
+      <div class="reason" id="reason"><strong>Reason:</strong> <span id="reasonText">Checking...</span></div>
+      <div class="meta"><strong>Destination:</strong> <span id="destHost">—</span><div id="destFull"></div></div>
+      <div class="source">Decision source: <strong id="decisionSource">—</strong></div>
       <div class="actions">
-        <!-- Removed "Proceed anyway" button as requested -->
-        <button id="allowBtn" class="btn-allow" title="Add this host to the allowlist and continue">Allow this host and proceed</button>
-        <button id="closeBtn" class="btn-close" title="Close this tab">Close tab</button>
+        <button id="allowBtn" class="btn-allow">Allow this host and proceed</button>
+        <button id="closeBtn" class="btn-close">Close tab</button>
       </div>
-
-      <div class="note">
-        If this site is a false positive, you can report it to Google Safe Browsing.
-        <a class="help" id="reportLink" href="#" target="_blank" rel="noopener">Report this website</a>
-      </div>
-
-      <footer>
-        Anti-Phish Guard — pre-visit protection. Host-only logging may be enabled during testing.
-      </footer>
     </div>
   </div>
-
   <script src="warning.js"></script>
 </body>
 </html>

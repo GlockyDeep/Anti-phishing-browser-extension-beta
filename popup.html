@@ -4,36 +4,21 @@
   <meta charset="utf-8" />
   <title>Anti-Phish Guard</title>
   <style>
-    :root {
-      --bg: #ffffff;
-      --muted: #6b7280;
-      --accent: #0b5cff;
-      --danger: #d9534f;
-      --card: #f8fafc;
-      --border: #e6e6e6;
-      --radius: 8px;
-      --pad: 12px;
-      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
-    }
-    body { background: var(--bg); color: #111827; width: 360px; margin: 0; padding: 14px; box-sizing: border-box; }
-    header { display:flex; gap:10px; align-items:center; }
-    header h3 { margin:0; font-size:16px; }
-    .subtitle { font-size:12px; color:var(--muted); margin-top:4px; }
-    .card { background: var(--card); padding: 10px; border: 1px solid var(--border); border-radius: var(--radius); margin-top:12px; }
-    label { display:flex; align-items:center; gap:8px; }
-    .row { display:flex; align-items:center; gap:8px; margin-top:10px; }
-    .controls { display:flex; gap:8px; margin-top:12px; }
-    button { cursor:pointer; border: none; padding: 8px 12px; border-radius:6px; }
-    .btn-primary { background: var(--accent); color: white; }
-    .btn-danger { background: var(--danger); color: white; }
-    .btn-muted { background: #f0f2f7; color: #111827; }
-    .api-input { width:100%; box-sizing:border-box; padding:8px; margin-top:8px; font-family:monospace; border-radius:6px; border:1px solid var(--border); }
-    .small { font-size:12px; color:var(--muted); margin-top:8px; }
-    #allowlist { font-size: 12px; margin-top: 8px; max-height: 120px; overflow:auto; border:1px solid var(--border); padding:8px; background: #fff; border-radius:6px; }
-    .host-row { display:flex; justify-content:space-between; gap:8px; padding:6px 0; border-bottom:1px solid #f3f4f6; }
-    .host-row button { font-size:12px; padding:4px 8px; }
-    .footer { font-size:11px; color:var(--muted); margin-top:10px; text-align:left; }
-    .warning { font-size:12px; color:#b45309; margin-top:8px; }
+    :root { --bg:#fff; --muted:#6b7280; --accent:#0b5cff; --danger:#d9534f; --card:#f8fafc; --border:#e6e6e6; --radius:8px; }
+    body{background:var(--bg);color:#111827;width:380px;margin:0;padding:12px;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;}
+    header{display:flex;gap:10px;align-items:center}
+    h3{margin:0;font-size:16px}
+    .card{background:var(--card);padding:10px;border:1px solid var(--border);border-radius:8px;margin-top:10px}
+    label{display:flex;align-items:center;gap:8px}
+    .small{font-size:12px;color:var(--muted);margin-top:6px}
+    .field-row{display:flex;gap:8px;align-items:center;margin-top:8px}
+    .api-input{flex:1;padding:8px;border-radius:6px;border:1px solid var(--border);font-family:monospace}
+    .controls{display:flex;gap:8px;margin-top:12px}
+    button{padding:8px 10px;border-radius:6px;border:none;cursor:pointer}
+    .btn-muted{background:#f0f2f7}
+    .warning{color:#b45309;font-size:12px;margin-top:8px}
+    #secondaryControls.disabled{opacity:0.6;pointer-events:none}
+    .mutual-note{font-size:12px;color:var(--muted);margin-top:6px}
   </style>
 </head>
 <body>
@@ -41,45 +26,55 @@
     <img src="icons/icon48.svg" width="28" height="28" alt="">
     <div>
       <h3>Anti-Phish Guard</h3>
-      <div class="subtitle">Pre-visit phishing protection (prototype)</div>
+      <div class="small">Pre-visit phishing protection</div>
     </div>
   </header>
 
+  <div style="margin-top:10px">
+    <label><input id="toggle" type="checkbox"> Enabled</label>
+  </div>
+
   <div class="card">
-    <label><input id="toggle" type="checkbox" /> Enabled</label>
+    <div id="secondaryControls">
+      <div style="margin-top:6px"><label><input id="useCloud" type="checkbox"> Use cloud lookup (Safe Browsing proxy)</label></div>
+      <div class="small">Proxy: <code>http://localhost:3000</code></div>
 
-    <div class="row" style="margin-top:8px;">
-      <label style="margin:0;"><input id="useCloud" type="checkbox" /> Use cloud lookup (Safe Browsing proxy)</label>
+      <div style="margin-top:8px">
+        <label><input id="useSafeOnly" type="checkbox"> Use Google Safe Browsing only (skip local DB for navigations)</label>
+        <div class="small">When enabled, navigations will prefer Google Safe Browsing. Provide an API key below to call Google directly (strict mode disables proxy fallback).</div>
+      </div>
+
+      <div class="field-row">
+        <div style="min-width:160px;font-size:13px;color:var(--muted)">Safe Browsing API key</div>
+        <input id="apiKey" class="api-input" type="password" placeholder="Paste API key (optional)">
+      </div>
+
+      <div class="mutual-note" id="mutualNote">
+        Note: Cloud lookup and direct API are mutually exclusive. Enabling one will disable the other.
+      </div>
+
+      <div style="margin-top:8px">
+        <label><input id="strictSafeOnly" type="checkbox"> Strict Google-only (no proxy fallback)</label>
+        <div class="small">When checked, Safe-only requires a direct API key and will NOT call the proxy.</div>
+      </div>
+
+      <div style="margin-top:8px">
+        <label><input id="preferGoogleFirst" type="checkbox"> Call Google first (even if heuristics match)</label>
+        <div class="small">When checked, navigations will query Safe Browsing before heuristics.</div>
+      </div>
+
+      <div class="controls">
+        <button id="reportBtn" class="btn-muted">Report current site</button>
+        <button id="refreshFeeds" class="btn-muted">Refresh feeds</button>
+      </div>
+
+      <div id="safeOnlyWarning" class="warning" style="display:none">Strict Safe-only requires a Safe Browsing API key. Please paste a key above.</div>
     </div>
-    <div class="small">Run the proxy at <code>http://localhost:3000</code> and enable this option.</div>
-
-    <div style="margin-top:8px;">
-      <label style="margin:0;"><input id="useDirect" type="checkbox" /> Use direct Safe Browsing lookup (embed API key)</label>
-      <input id="apiKey" class="api-input" type="password" placeholder="Paste Safe Browsing API key (insecure)" />
-      <div class="small">Only use direct lookup for temporary testing. Do NOT publish with a real key.</div>
-    </div>
-
-    <div style="margin-top:10px;">
-      <label style="margin:0;"><input id="useSafeOnly" type="checkbox" /> Use Google Safe Browsing only (skip local DB for navigations)</label>
-      <div class="small">When enabled, navigations will prefer Google Safe Browsing instead of local blocklist/urlhaus. Requires direct API key for true "Google-only" operation.</div>
-      <div id="safeOnlyWarning" class="warning" style="display:none;">No direct API key set. Enable "Use direct lookup" and paste an API key to guarantee Google-only checks.</div>
-    </div>
-
-    <div class="controls" style="margin-top:12px;">
-      <button id="reportBtn" class="btn-danger">Report this website</button>
-      <button id="refreshFeeds" class="btn-muted">Refresh feeds</button>
-    </div>
-
   </div>
 
-  <div style="margin-top:12px;">
+  <div style="margin-top:12px">
     <strong>Allowlist</strong>
-    <div id="allowlist">(none)</div>
-    <div class="small">Use the warning page's "Allow and proceed" to add a host, or remove entries below.</div>
-  </div>
-
-  <div class="footer">
-    Host-only reporting and logs are used only for local testing. See README for details.
+    <div id="allowlist" style="font-size:12px;margin-top:6px;border:1px solid var(--border);padding:8px;border-radius:6px;max-height:120px;overflow:auto">(none)</div>
   </div>
 
   <script src="popup.js"></script>
