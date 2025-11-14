@@ -1,29 +1,19 @@
-// content_script.js
-// Shows a small host-only badge (green/red/gray) when hovering links.
-// Debounced checks; calls background via chrome.runtime.sendMessage and uses a simple cache.
-//
-// Fixes:
-// - Don't run on privileged/special pages (chrome://, about:, devtools, etc).
-// - Avoid using 'unload' (permission policy violation on some pages). Use 'pagehide' / 'visibilitychange' with try/catch.
-// - Guard DOM insertion with try/catch to avoid exceptions on restricted pages.
+// content_script.js - host-only hover checks (robust to extension context invalidation)
+// - Uses safeSendMessage to avoid unhandled promise rejections when the SW is restarted or extension reloaded.
+// - Compatible with MV3: checks chrome.runtime.lastError in callback and times out gracefully.
 
 (function () {
-  // Only run on normal web pages (http/https/file). Skip chrome://, about:, data:, etc.
+  // Only run on normal web pages (http/https/file). Bail out on chrome://, about:, extensions pages, etc.
   try {
     const allowed = /^https?:|^file:/.test(location.protocol);
-    if (!allowed) {
-      // Not a standard web page — bail out silently.
-      // console.debug('[APG] content_script skipped on protocol', location.protocol);
-      return;
-    }
+    if (!allowed) return;
   } catch (e) {
-    // If accessing location.protocol fails for any reason, bail out.
     return;
   }
 
   const DEBOUNCE_MS = 300;
   const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-  const cache = new Map(); // key -> {status, reason, ts}
+  const cache = new Map(); // host -> {status, reason, ts}
 
   // Create badge element (guarded)
   let badge = null;
@@ -42,13 +32,8 @@
     badge.style.opacity = '0';
     badge.style.transform = 'translateY(4px)';
     badge.style.display = 'none';
-    // Try to append; some pages may disallow DOM mutations — guard it
-    try {
-      document.documentElement.appendChild(badge);
-    } catch (e) {
-      // If append fails, disable badge usage
-      badge = null;
-    }
+    // Append with try/catch: some pages may restrict DOM mutations
+    try { document.documentElement.appendChild(badge); } catch (e) { badge = null; }
   } catch (e) {
     badge = null;
   }
@@ -84,17 +69,9 @@
     }, 150);
   }
 
-  function resolveHref(href) {
-    try {
-      return new URL(href, document.baseURI).href;
-    } catch (e) {
-      return null;
-    }
-  }
-
   function hostnameOf(url) {
     try {
-      return new URL(url).hostname.toLowerCase();
+      return new URL(url, document.baseURI).hostname.toLowerCase();
     } catch (e) {
       return null;
     }
@@ -114,25 +91,74 @@
     cache.set(key, value);
   }
 
-  function checkUrl(url) {
+  // Robust sendMessage wrapper:
+  // - Uses callback form to reliably see chrome.runtime.lastError
+  // - Catches synchronous exceptions
+  // - Times out after `timeoutMs` and returns an error object
+  function safeSendMessage(message, timeoutMs = 1500) {
     return new Promise((resolve) => {
-      const cached = getCached(url);
-      if (cached) return resolve({ status: cached.status, reason: cached.reason, source: 'cache' });
-
-      chrome.runtime.sendMessage({ type: 'CHECK_URL_HOVER', url }, (resp) => {
-        if (chrome.runtime.lastError) {
-          resolve({ status: 'unknown', reason: 'extension unavailable' });
-          return;
+      let settled = false;
+      try {
+        chrome.runtime.sendMessage(message, (resp) => {
+          if (settled) return;
+          settled = true;
+          if (chrome.runtime.lastError) {
+            resolve({ error: chrome.runtime.lastError.message });
+          } else {
+            resolve({ resp });
+          }
+        });
+      } catch (err) {
+        // synchronous throw (e.g., extension context invalidated)
+        if (!settled) {
+          settled = true;
+          resolve({ error: err && err.message ? err.message : String(err) });
         }
-        if (!resp) {
-          resolve({ status: 'unknown', reason: 'no-response' });
-          return;
-        }
-        const out = { status: resp.status || 'unknown', reason: resp.reason || '', raw: resp };
-        setCached(url, { status: out.status, reason: out.reason });
-        resolve(out);
-      });
+      }
+      // timeout fallback
+      setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        resolve({ error: 'timeout' });
+      }, timeoutMs);
     });
+  }
+
+  // Host-only hover check using safeSendMessage; never throws unhandled rejections
+  async function checkHost(host) {
+    // host-only cache
+    const cached = getCached(host);
+    if (cached) return cached;
+
+    try {
+      const { resp, error } = await (async () => {
+        const r = await safeSendMessage({ type: 'CHECK_HOST_HOVER', host }, 1500);
+        // safeSendMessage returns { resp } or { error }
+        return r;
+      })();
+
+      if (error) {
+        // Known case: extension reloaded / SW restarted -> treat as unknown, cache lightly
+        const fallback = { status: 'unknown', reason: error };
+        setCached(host, fallback);
+        return fallback;
+      }
+
+      const messageResp = (resp && resp.resp) ? resp.resp : resp; // safeSendMessage shape: { resp } or nested
+      if (!messageResp) {
+        const fallback = { status: 'unknown', reason: 'no-response' };
+        setCached(host, fallback);
+        return fallback;
+      }
+      const out = { status: messageResp.status || 'unknown', reason: messageResp.reason || '' };
+      setCached(host, out);
+      return out;
+    } catch (e) {
+      // Shouldn't happen because safeSendMessage never throws, but guard anyway
+      const fallback = { status: 'unknown', reason: e && e.message ? e.message : String(e) };
+      setCached(host, fallback);
+      return fallback;
+    }
   }
 
   function findLinkElement(el) {
@@ -144,82 +170,101 @@
   }
 
   let hoverTimer = null;
-  let lastUrlChecked = null;
+  let lastHostChecked = null;
   let lastMouse = { x: 0, y: 0 };
 
-  document.addEventListener('mousemove', (ev) => {
-    lastMouse.x = ev.clientX;
-    lastMouse.y = ev.clientY;
-    if (badge && badge.style.display === 'block') {
-      showBadgeAt(lastMouse.x, lastMouse.y, badge.textContent, badge.style.background);
-    }
-  }, { passive: true });
+  // Keep badge positioned near cursor while visible
+  try {
+    document.addEventListener('mousemove', (ev) => {
+      lastMouse.x = ev.clientX;
+      lastMouse.y = ev.clientY;
+      if (badge && badge.style.display === 'block') {
+        showBadgeAt(lastMouse.x, lastMouse.y, badge.textContent, badge.style.background);
+      }
+    }, { passive: true });
+  } catch (e) { /* ignore */ }
 
-  document.addEventListener('mouseover', (ev) => {
-    const linkEl = findLinkElement(ev.target);
-    if (!linkEl) {
-      if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null; }
-      hideBadge();
-      return;
-    }
-
-    let href = null;
-    if (linkEl.tagName && linkEl.tagName.toLowerCase() === 'a') {
-      href = linkEl.getAttribute('href');
-    } else if (linkEl.getAttribute && linkEl.getAttribute('data-href')) {
-      href = linkEl.getAttribute('data-href');
-    } else if (linkEl.getAttribute && linkEl.getAttribute('href')) {
-      href = linkEl.getAttribute('href');
-    }
-
-    const resolved = resolveHref(href);
-    if (!resolved) {
-      showBadgeAt(lastMouse.x, lastMouse.y, 'Unknown', '#6b7280');
-      return;
-    }
-
-    if (resolved === lastUrlChecked && badge && badge.style.display === 'block') {
-      showBadgeAt(lastMouse.x, lastMouse.y, badge.textContent, badge.style.background);
-      return;
-    }
-
-    if (hoverTimer) clearTimeout(hoverTimer);
-    hoverTimer = setTimeout(async () => {
-      hoverTimer = null;
-      lastUrlChecked = resolved;
-
-      const cached = getCached(resolved);
-      if (cached) {
-        const color = cached.status === 'unsafe' ? '#d9534f' : (cached.status === 'safe' ? '#16a34a' : '#6b7280');
-        showBadgeAt(lastMouse.x, lastMouse.y, cached.status.toUpperCase(), color);
-        if (badge) badge.title = cached.reason || '';
+  try {
+    document.addEventListener('mouseover', (ev) => {
+      const linkEl = findLinkElement(ev.target);
+      if (!linkEl) {
+        if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null; }
+        hideBadge();
         return;
       }
 
-      showBadgeAt(lastMouse.x, lastMouse.y, 'Checking…', '#6b7280');
+      // Extract href (support anchors and data-href)
+      let href = null;
+      try {
+        if (linkEl.tagName && linkEl.tagName.toLowerCase() === 'a') {
+          href = linkEl.getAttribute('href');
+        } else if (linkEl.getAttribute && linkEl.getAttribute('data-href')) {
+          href = linkEl.getAttribute('data-href');
+        } else if (linkEl.getAttribute && linkEl.getAttribute('href')) {
+          href = linkEl.getAttribute('href');
+        }
+      } catch (e) {
+        href = null;
+      }
 
-      const result = await checkUrl(resolved);
-      const s = result.status || 'unknown';
-      const color = s === 'unsafe' ? '#d9534f' : (s === 'safe' ? '#16a34a' : '#6b7280');
-      showBadgeAt(lastMouse.x, lastMouse.y, s.toUpperCase(), color);
-      if (badge) badge.title = result.reason || '';
-    }, DEBOUNCE_MS);
-  }, true);
+      // Resolve to absolute URL and extract host
+      let host = null;
+      try {
+        const resolved = new URL(href, document.baseURI).href;
+        host = hostnameOf(resolved);
+      } catch (e) {
+        host = null;
+      }
 
-  document.addEventListener('mouseout', (ev) => {
-    if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null; }
-    hideBadge();
-  }, true);
+      if (!host) {
+        showBadgeAt(lastMouse.x, lastMouse.y, 'Unknown', '#6b7280');
+        return;
+      }
 
-  // Cleanup: pagehide is safer than unload on many pages; use visibilitychange as backup.
+      if (host === lastHostChecked && badge && badge.style.display === 'block') {
+        showBadgeAt(lastMouse.x, lastMouse.y, badge.textContent, badge.style.background);
+        return;
+      }
+
+      if (hoverTimer) clearTimeout(hoverTimer);
+      hoverTimer = setTimeout(async () => {
+        hoverTimer = null;
+        lastHostChecked = host;
+
+        const cached = getCached(host);
+        if (cached) {
+          const color = cached.status === 'unsafe' ? '#d9534f' : (cached.status === 'safe' ? '#16a34a' : '#6b7280');
+          showBadgeAt(lastMouse.x, lastMouse.y, cached.status.toUpperCase(), color);
+          if (badge) badge.title = cached.reason || '';
+          return;
+        }
+
+        showBadgeAt(lastMouse.x, lastMouse.y, 'Checking…', '#6b7280');
+
+        const result = await checkHost(host);
+        const s = result.status || 'unknown';
+        const color = s === 'unsafe' ? '#d9534f' : (s === 'safe' ? '#16a34a' : '#6b7280');
+        showBadgeAt(lastMouse.x, lastMouse.y, s.toUpperCase(), color);
+        if (badge) badge.title = result.reason || '';
+      }, DEBOUNCE_MS);
+    }, true);
+  } catch (e) { /* ignore */ }
+
+  try {
+    document.addEventListener('mouseout', (ev) => {
+      if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null; }
+      hideBadge();
+    }, true);
+  } catch (e) { /* ignore */ }
+
+  // Cleanup: pagehide is safer than unload on many pages; visibilitychange as backup.
   try {
     window.addEventListener('pagehide', () => {
       if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null; }
       hideBadge();
     }, { passive: true });
-  } catch (e) {
-    // ignore
-  }
+  } catch (e) { /* ignore */ }
+
   try {
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'hidden') {
@@ -227,9 +272,7 @@
         hideBadge();
       }
     }, { passive: true });
-  } catch (e) {
-    // ignore
-  }
+  } catch (e) { /* ignore */ }
 
-  // No unload listener due to permission policy on some pages.
+  // Note: intentionally NOT using 'unload' to avoid permission-policy errors on privileged pages.
 })();

@@ -1,6 +1,6 @@
 // popup.js - updated UI for Anti-Phish Guard
-// - removed "Allow current site" button
-// - added "Report this website" button that opens Google's report page and also POSTs to proxy /report (best-effort)
+// - Added "Use Google Safe Browsing only" toggle that saves useSafeBrowsingOnly
+// - Warns user if they enable it without a direct API key
 
 document.addEventListener('DOMContentLoaded', async () => {
   const toggle = document.getElementById('toggle');
@@ -10,17 +10,21 @@ document.addEventListener('DOMContentLoaded', async () => {
   const allowlistDiv = document.getElementById('allowlist');
   const reportBtn = document.getElementById('reportBtn');
   const refreshFeeds = document.getElementById('refreshFeeds');
+  const useSafeOnly = document.getElementById('useSafeOnly');
+  const safeOnlyWarning = document.getElementById('safeOnlyWarning');
 
   const PROXY_REPORT_ENDPOINT = 'http://localhost:3000/report'; // best-effort; proxy may not implement
 
   // load state
-  const s = await chrome.storage.local.get(['enabled','allowlist','useCloudLookup','useDirectLookup','directApiKey']);
+  const s = await chrome.storage.local.get(['enabled','allowlist','useCloudLookup','useDirectLookup','directApiKey','useSafeBrowsingOnly']);
   toggle.checked = s.enabled !== undefined ? s.enabled : true;
   useCloud.checked = s.useCloudLookup || false;
   useDirect.checked = s.useDirectLookup || false;
   apiKeyInput.value = s.directApiKey || '';
+  useSafeOnly.checked = s.useSafeBrowsingOnly || false;
   let allowlist = s.allowlist || [];
   renderAllowlist();
+  updateSafeOnlyWarning();
 
   toggle.addEventListener('change', () => {
     chrome.storage.local.set({enabled: toggle.checked});
@@ -32,10 +36,22 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   useDirect.addEventListener('change', () => {
     chrome.storage.local.set({useDirectLookup: useDirect.checked});
+    updateSafeOnlyWarning();
   });
 
   apiKeyInput.addEventListener('input', () => {
     chrome.storage.local.set({directApiKey: apiKeyInput.value});
+    updateSafeOnlyWarning();
+  });
+
+  useSafeOnly.addEventListener('change', () => {
+    const v = useSafeOnly.checked;
+    chrome.storage.local.set({useSafeBrowsingOnly: v});
+    updateSafeOnlyWarning();
+    if (v && !apiKeyInput.value && !useDirect.checked) {
+      // guide user to enable direct lookup & paste key
+      alert('To ensure "Google-only" checks, enable "Use direct lookup" and paste a Safe Browsing API key. Without a direct key, the extension may fall back to the proxy which could consult local feeds.');
+    }
   });
 
   // Refresh feeds: best-effort ping to proxy to ask it to reload feeds (proxy may choose to implement)
@@ -46,9 +62,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         alert('Proxy not reachable on http://localhost:3000');
         return;
       }
-      // Try calling a reload endpoint if the proxy offers it; fallback to health response
       try {
-        // If your proxy has a refresh endpoint, it can be called here:
         await fetch('http://localhost:3000/refresh-feeds', { method: 'POST' });
         alert('Requested feed refresh (proxy must support /refresh-feeds).');
       } catch (e) {
@@ -69,11 +83,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         return;
       }
       const url = tab.url;
-      // Open Google's Safe Browsing report form pre-filled
       const reportUrl = 'https://safebrowsing.google.com/safebrowsing/report_phish/?hl=en&url=' + encodeURIComponent(url);
       chrome.tabs.create({ url: reportUrl });
 
-      // Best-effort: send host-only report to local proxy for centralized reporting (proxy must implement POST /report).
       let host = null;
       try { host = new URL(url).hostname.toLowerCase(); } catch (e) { host = null; }
       if (host) {
@@ -84,7 +96,6 @@ document.addEventListener('DOMContentLoaded', async () => {
             body: JSON.stringify({ timestamp: new Date().toISOString(), host })
           });
         } catch (e) {
-          // ignore if proxy doesn't implement /report or is unreachable
           console.warn('Proxy report failed (ignored)', e);
         }
       }
@@ -117,5 +128,15 @@ document.addEventListener('DOMContentLoaded', async () => {
       row.appendChild(rm);
       allowlistDiv.appendChild(row);
     });
+  }
+
+  function updateSafeOnlyWarning() {
+    const hasKey = !!apiKeyInput.value;
+    const directEnabled = useDirect.checked;
+    if (useSafeOnly.checked && !hasKey && !directEnabled) {
+      safeOnlyWarning.style.display = 'block';
+    } else {
+      safeOnlyWarning.style.display = 'none';
+    }
   }
 });

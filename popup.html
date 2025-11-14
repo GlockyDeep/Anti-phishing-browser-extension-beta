@@ -15,7 +15,7 @@
       --pad: 12px;
       font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
     }
-    body { background: var(--bg); color: #111827; width: 340px; margin: 0; padding: 14px; box-sizing: border-box; }
+    body { background: var(--bg); color: #111827; width: 360px; margin: 0; padding: 14px; box-sizing: border-box; }
     header { display:flex; gap:10px; align-items:center; }
     header h3 { margin:0; font-size:16px; }
     .subtitle { font-size:12px; color:var(--muted); margin-top:4px; }
@@ -33,6 +33,7 @@
     .host-row { display:flex; justify-content:space-between; gap:8px; padding:6px 0; border-bottom:1px solid #f3f4f6; }
     .host-row button { font-size:12px; padding:4px 8px; }
     .footer { font-size:11px; color:var(--muted); margin-top:10px; text-align:left; }
+    .warning { font-size:12px; color:#b45309; margin-top:8px; }
   </style>
 </head>
 <body>
@@ -47,15 +48,21 @@
   <div class="card">
     <label><input id="toggle" type="checkbox" /> Enabled</label>
 
-    <div class="row">
+    <div class="row" style="margin-top:8px;">
       <label style="margin:0;"><input id="useCloud" type="checkbox" /> Use cloud lookup (Safe Browsing proxy)</label>
     </div>
     <div class="small">Run the proxy at <code>http://localhost:3000</code> and enable this option.</div>
 
     <div style="margin-top:8px;">
-      <label style="margin:0;"><input id="useDirect" type="checkbox" /> Use direct lookup (embed API key)</label>
+      <label style="margin:0;"><input id="useDirect" type="checkbox" /> Use direct Safe Browsing lookup (embed API key)</label>
       <input id="apiKey" class="api-input" type="password" placeholder="Paste Safe Browsing API key (insecure)" />
-      <div class="small">Only for temporary testing. Do NOT publish with a real key.</div>
+      <div class="small">Only use direct lookup for temporary testing. Do NOT publish with a real key.</div>
+    </div>
+
+    <div style="margin-top:10px;">
+      <label style="margin:0;"><input id="useSafeOnly" type="checkbox" /> Use Google Safe Browsing only (skip local DB for navigations)</label>
+      <div class="small">When enabled, navigations will prefer Google Safe Browsing instead of local blocklist/urlhaus. Requires direct API key for true "Google-only" operation.</div>
+      <div id="safeOnlyWarning" class="warning" style="display:none;">No direct API key set. Enable "Use direct lookup" and paste an API key to guarantee Google-only checks.</div>
     </div>
 
     <div class="controls" style="margin-top:12px;">
@@ -72,7 +79,7 @@
   </div>
 
   <div class="footer">
-    Anti-Phish Guard is Not affiliated with Google or any other entity.
+    Host-only reporting and logs are used only for local testing. See README for details.
   </div>
 
   <script src="popup.js"></script>

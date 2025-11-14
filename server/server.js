@@ -1,10 +1,6 @@
 // server.js
-// Safe Browsing proxy + OpenPhish feed fetching + local URLhaus hostlist (NO writing/rewriting local URLhaus file).
-//
-// Changes versus previous version:
-// - Do NOT write merged hosts back to server/data/urlhaus_hosts.txt (we only read the local file).
-// - UpdateFeeds fetches OpenPhish and reads local URLhaus file, merges into in-memory set only.
-// - Less noisy logging around feed persistence (no "Wrote merged hosts").
+// Safe Browsing proxy + OpenPhish feed fetching + local URLhaus hostlist (read-only).
+// Added: safebrowsing_used flag on /check responses; /log prints apiUsed when present.
 //
 // Usage:
 //   NODE_API_KEY=YOUR_GOOGLE_KEY node server.js
@@ -87,12 +83,10 @@ function readLocalUrlhausHosts() {
   }
 }
 
-// Update feeds: fetch OpenPhish, load local URLhaus file, merge into in-memory set.
-// IMPORTANT: This function does NOT write the merged hosts back to disk.
+// Update feeds: fetch OpenPhish, load local URLhaus file, merge into in-memory set (read-only file behavior).
 async function updateFeeds() {
   try {
     console.log('[Proxy] Updating OpenPhish and reloading local URLhaus hosts (read-only)...');
-    const now = Date.now();
 
     // fetch OpenPhish
     const openHosts = await fetchOpenPhishFeed();
@@ -205,7 +199,28 @@ app.post('/refresh-feeds', async (req, res) => {
   }
 });
 
-// POST /log - receive navigation logs and print host-only to console
+// GET /checkHost?host=...  <-- host-only checks (used by hover)
+app.options('/checkHost', (req, res) => {
+  setCorsHeaders(res);
+  res.sendStatus(204);
+});
+app.get('/checkHost', (req, res) => {
+  setCorsHeaders(res);
+  const host = (req.query.host || '').toString().toLowerCase().trim();
+  if (!host) return res.status(400).json({ error: 'missing host' });
+  try {
+    const matched = findMatchingHostInSet(host);
+    if (matched) {
+      return res.json({ unsafe: true, matchedHost: matched, source: 'feeds', safebrowsing_used: false });
+    }
+    return res.json({ unsafe: false, safebrowsing_used: false });
+  } catch (e) {
+    console.warn('checkHost failed', e);
+    return res.status(500).json({ error: 'checkHost failed' });
+  }
+});
+
+// POST /log - receive navigation/hover logs and print host-only to console
 app.post('/log', (req, res) => {
   setCorsHeaders(res);
   try {
@@ -223,14 +238,18 @@ app.post('/log', (req, res) => {
     const tabId = body.tabId !== undefined ? String(body.tabId) : '-';
     const blocked = !!body.blocked;
     const reason = body.reason || '';
+    const event = body.event || 'visit';
     const heuristicsOnly = !!body.heuristicsOnly;
+    const apiUsed = body.apiUsed === true;
     const extra = body.extra || null;
 
     const parts = [
       `[NAV] ${ts}`,
+      `event=${event}`,
       `tab=${tabId}`,
       `host=${host}`,
       `blocked=${blocked}`,
+      apiUsed ? `apiUsed=true` : `apiUsed=false`,
       reason ? `reason=${reason}` : '',
       heuristicsOnly ? `heuristicsOnly=true` : '',
       extra ? `extra=${JSON.stringify(extra)}` : ''
@@ -270,11 +289,13 @@ app.get('/check', async (req, res) => {
   // cache check
   const c = cache.get(key);
   if (c && (now - c.ts) < CACHE_TTL_MS) {
-    return res.json({ safe: c.safe, matches: c.matches, cached: true });
+    // preserve safebrowsing_used if cached
+    return res.json({ safe: c.safe, matches: c.matches, cached: true, safebrowsing_used: !!c.safebrowsing_used });
   }
 
   let combinedMatches = { feeds: null, safebrowsing: null, phishtank: null };
   let safe = true;
+  let safebrowsing_used = false; // will be true only if we call Google Safe Browsing
 
   // 1) Quick local check: merged feeds (OpenPhish + local URLhaus in-memory)
   try {
@@ -287,16 +308,17 @@ app.get('/check', async (req, res) => {
       if (matchedHost) {
         combinedMatches.feeds = { matchedHost, source: 'feeds' };
         safe = false;
-        cache.set(key, { safe, matches: combinedMatches, ts: Date.now() });
-        return res.json({ safe, matches: combinedMatches, cached: false });
+        cache.set(key, { safe, matches: combinedMatches, ts: Date.now(), safebrowsing_used: false });
+        return res.json({ safe, matches: combinedMatches, cached: false, safebrowsing_used: false });
       }
     }
   } catch (e) {
     console.warn('Local feeds check failed', e);
   }
 
-  // 2) Google Safe Browsing
+  // 2) Google Safe Browsing (only if local feeds didn't match)
   try {
+    safebrowsing_used = true;
     const resp = await fetch(`https://safebrowsing.googleapis.com/v4/threatMatches:find?key=${API_KEY}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -305,19 +327,23 @@ app.get('/check', async (req, res) => {
     if (!resp.ok) {
       const text = await resp.text();
       console.error('Safe Browsing non-OK response', resp.status, text);
-      return res.status(500).json({ error: 'safe browsing lookup failed' });
+      // treat as safe for now but indicate safebrowsing_used
+      cache.set(key, { safe: true, matches: combinedMatches, ts: Date.now(), safebrowsing_used: safebrowsing_used });
+      return res.json({ safe: true, matches: combinedMatches, cached: false, safebrowsing_used });
     }
     const j = await resp.json();
     const sbMatches = j.matches || null;
     combinedMatches.safebrowsing = sbMatches;
     if (sbMatches) {
       safe = false;
-      cache.set(key, { safe, matches: combinedMatches, ts: Date.now() });
-      return res.json({ safe, matches: combinedMatches, cached: false });
+      cache.set(key, { safe, matches: combinedMatches, ts: Date.now(), safebrowsing_used });
+      return res.json({ safe, matches: combinedMatches, cached: false, safebrowsing_used: safebrowsing_used });
     }
   } catch (err) {
     console.error('Safe Browsing request failed', err);
-    return res.status(500).json({ error: 'safe browsing lookup failed' });
+    // On SB failure, return safe:true but indicate SB was attempted
+    cache.set(key, { safe: true, matches: combinedMatches, ts: Date.now(), safebrowsing_used });
+    return res.json({ safe: true, matches: combinedMatches, cached: false, safebrowsing_used });
   }
 
   // 3) Optional PhishTank
@@ -327,8 +353,8 @@ app.get('/check', async (req, res) => {
       combinedMatches.phishtank = pt;
       if (pt && pt.in_database && pt.valid) {
         safe = false;
-        cache.set(key, { safe, matches: combinedMatches, ts: Date.now() });
-        return res.json({ safe, matches: combinedMatches, cached: false });
+        cache.set(key, { safe, matches: combinedMatches, ts: Date.now(), safebrowsing_used });
+        return res.json({ safe, matches: combinedMatches, cached: false, safebrowsing_used });
       }
     } catch (e) {
       console.warn('PhishTank check failed', e);
@@ -336,8 +362,8 @@ app.get('/check', async (req, res) => {
   }
 
   // no matches -> safe
-  cache.set(key, { safe, matches: combinedMatches, ts: Date.now() });
-  return res.json({ safe, matches: combinedMatches, cached: false });
+  cache.set(key, { safe, matches: combinedMatches, ts: Date.now(), safebrowsing_used });
+  return res.json({ safe, matches: combinedMatches, cached: false, safebrowsing_used });
 });
 
 // Health endpoint
