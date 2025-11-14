@@ -1,62 +1,85 @@
-// popup.js - updated popup logic to allow enabling cloud lookup even when an API key exists
-// - If you try to enable "Use cloud lookup" while a direct API key is present, prompt to confirm clearing the key.
-// - Keeps mutual exclusivity (cloud vs direct) but gives user control to switch modes.
-// - Prevents enabling strict Safe-only without a key.
+// popup.js - enforce strict mutual exclusivity between:
+// - "Use cloud lookup (Safe Browsing proxy)" and
+// - "Use Google Safe Browsing only (skip local DB for navigations)"
+//
+// Behavior:
+// - You cannot have both checked simultaneously. Checking one will automatically uncheck the other.
+// - If you paste an API key, cloud lookup will be disabled (with confirmation if cloud was active).
+// - If you enable cloud lookup while an API key exists, you'll be asked to confirm clearing the key.
+// - Visual inline notice explains the currently active mode.
 
 document.addEventListener('DOMContentLoaded', async () => {
   const toggle = document.getElementById('toggle');
   const useCloud = document.getElementById('useCloud');
   const useSafeOnly = document.getElementById('useSafeOnly');
   const apiKeyInput = document.getElementById('apiKey');
-  const strictSafeOnly = document.getElementById('strictSafeOnly');
-  const preferGoogleFirst = document.getElementById('preferGoogleFirst');
   const secondaryControls = document.getElementById('secondaryControls');
   const safeOnlyWarning = document.getElementById('safeOnlyWarning');
   const reportBtn = document.getElementById('reportBtn');
   const refreshFeeds = document.getElementById('refreshFeeds');
   const allowlistDiv = document.getElementById('allowlist');
   const mutualNote = document.getElementById('mutualNote');
+  const modeNotice = document.getElementById('modeNotice');
 
-  // load state
+  // Load stored state
   const s = await chrome.storage.local.get([
-    'enabled','useCloudLookup','directApiKey','useSafeBrowsingOnly',
-    'useSafeBrowsingOnlyStrict','preferGoogleFirst','allowlist','useDirectLookup'
+    'enabled','useCloudLookup','directApiKey','useSafeBrowsingOnly','allowlist','useDirectLookup'
   ]);
   toggle.checked = s.enabled !== undefined ? s.enabled : true;
   useCloud.checked = s.useCloudLookup || false;
   apiKeyInput.value = s.directApiKey || '';
   useSafeOnly.checked = s.useSafeBrowsingOnly || false;
-  strictSafeOnly.checked = s.useSafeBrowsingOnlyStrict || false;
-  preferGoogleFirst.checked = s.preferGoogleFirst || false;
   let allowlist = s.allowlist || [];
 
   function setSecondaryEnabled(val) {
     if (!val) secondaryControls.classList.add('disabled'); else secondaryControls.classList.remove('disabled');
   }
 
-  // Initialize mutual-exclusivity and UI state
-  function applyMutualExclusivityOnLoad() {
-    const hasKey = !!apiKeyInput.value.trim();
-    // If cloud is checked but key exists, prefer cloud but clear key (to keep storage consistent)
-    if (useCloud.checked && hasKey) {
-      // clear key silently on load if cloud is checked
-      apiKeyInput.value = '';
-      chrome.storage.local.set({ directApiKey: '', useDirectLookup: false });
+  // Update mode notice text
+  function updateModeNotice() {
+    if (useCloud.checked) {
+      modeNotice.textContent = 'Active mode: Cloud lookup (proxy + feeds → Google fallback)';
+      modeNotice.style.display = 'block';
+    } else if (useSafeOnly.checked) {
+      const hasKey = !!apiKeyInput.value.trim();
+      modeNotice.textContent = hasKey
+        ? 'Active mode: Direct Google Safe Browsing (using API key)'
+        : 'Active mode: Google-preferred (no key provided — will fall back to proxy or heuristics)';
+      modeNotice.style.display = 'block';
+    } else {
+      modeNotice.textContent = 'Active mode: Local heuristics + host cache (no cloud/API selected)';
+      modeNotice.style.display = 'block';
     }
-    // If cloud is checked -> disable api input
-    apiKeyInput.disabled = useCloud.checked;
-    strictSafeOnly.disabled = useCloud.checked; // strict mode only meaningful with direct API
-    // If API key present -> disable cloud checkbox (but we allow explicit override when user clicks)
-    useCloud.disabled = false; // we'll enforce mutual exclusivity via handlers and prompts, not by permanently disabling the control
-    mutualNote.textContent = useCloud.checked
-      ? 'Cloud lookup is enabled — direct API is disabled.'
-      : (hasKey ? 'Direct API key present — cloud lookup will clear the key when enabled.' : 'Note: Cloud lookup and direct API are mutually exclusive.');
   }
 
-  applyMutualExclusivityOnLoad();
-  setSecondaryEnabled(toggle.checked);
-  renderAllowlist();
-  updateSafeOnlyWarning();
+  // Initialize UI and mutual exclusivity on load
+  function applyInitialState() {
+    const hasKey = !!apiKeyInput.value.trim();
+    // If both somehow set in storage, prefer API key -> keep useSafeOnly, clear cloud
+    if (useCloud.checked && useSafeOnly.checked) {
+      if (hasKey) {
+        useCloud.checked = false;
+        chrome.storage.local.set({ useCloudLookup: false });
+      } else {
+        // prefer cloud by default if no key
+        useSafeOnly.checked = false;
+        chrome.storage.local.set({ useSafeBrowsingOnly: false });
+      }
+    }
+    // Disable API input when cloud is active
+    apiKeyInput.disabled = useCloud.checked;
+    // Update mutual note text
+    mutualNote.textContent = useCloud.checked
+      ? 'Cloud lookup is enabled — direct API input is disabled.'
+      : (hasKey ? 'Direct API key present — enabling it will disable cloud lookup.' : 'Note: Cloud lookup and direct API are mutually exclusive.');
+    updateModeNotice();
+    setSecondaryEnabled(toggle.checked);
+    renderAllowlist();
+    // show warning if Safe-only without key and cloud disabled
+    updateSafeOnlyWarning();
+  }
+
+  applyInitialState();
 
   toggle.addEventListener('change', () => {
     chrome.storage.local.set({ enabled: toggle.checked });
@@ -65,52 +88,72 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // When user toggles cloud checkbox
   useCloud.addEventListener('change', async () => {
-    const val = useCloud.checked;
-
-    // If enabling cloud and there's a stored API key, confirm with user first
-    if (val) {
-      const current = await chrome.storage.local.get(['directApiKey']);
-      const storedKey = (current && current.directApiKey) ? current.directApiKey.trim() : '';
+    const enableCloud = useCloud.checked;
+    if (enableCloud) {
+      // If an API key exists, confirm clearing it
+      const cur = await chrome.storage.local.get(['directApiKey']);
+      const storedKey = (cur && cur.directApiKey) ? cur.directApiKey.trim() : '';
       if (storedKey) {
         const ok = confirm('Enabling cloud lookup will clear the stored Safe Browsing API key. Proceed and clear the key?');
         if (!ok) {
-          // revert checkbox
           useCloud.checked = false;
           return;
         }
-        // user confirmed: clear key and enable cloud
-        await chrome.storage.local.set({ useCloudLookup: true, directApiKey: '', useDirectLookup: false, useSafeBrowsingOnlyStrict: false });
+        // clear key and enable cloud
+        await chrome.storage.local.set({ useCloudLookup: true, directApiKey: '', useDirectLookup: false, useSafeBrowsingOnly: false });
         apiKeyInput.value = '';
         apiKeyInput.disabled = true;
-        strictSafeOnly.checked = false;
-        strictSafeOnly.disabled = true;
+        useSafeOnly.checked = false; // cannot have both
         mutualNote.textContent = 'Cloud lookup enabled — direct API key cleared.';
+        updateModeNotice();
         return;
       }
-      // no stored key -> just enable cloud
-      chrome.storage.local.set({ useCloudLookup: true });
+      // No key stored — enable cloud simply
+      await chrome.storage.local.set({ useCloudLookup: true });
       apiKeyInput.disabled = true;
-      strictSafeOnly.disabled = true;
+      // If Safe-only was checked, uncheck it
+      if (useSafeOnly.checked) {
+        useSafeOnly.checked = false;
+        await chrome.storage.local.set({ useSafeBrowsingOnly: false });
+      }
       mutualNote.textContent = 'Cloud lookup enabled — direct API disabled.';
+      updateModeNotice();
     } else {
-      // disabling cloud -> allow user to supply an API key again
-      chrome.storage.local.set({ useCloudLookup: false });
+      // Disabling cloud -> allow API input
+      await chrome.storage.local.set({ useCloudLookup: false });
       apiKeyInput.disabled = false;
-      strictSafeOnly.disabled = false;
       mutualNote.textContent = 'Cloud lookup disabled — you may paste a direct API key.';
+      updateModeNotice();
     }
   });
 
-  // API key input: when user pastes a key, disable cloud lookup after confirmation.
+  // When user toggles Safe-only checkbox, automatically deselect cloud if necessary
+  useSafeOnly.addEventListener('change', async () => {
+    const enableSafeOnly = useSafeOnly.checked;
+    if (enableSafeOnly) {
+      // If cloud is currently enabled, uncheck cloud and update storage
+      if (useCloud.checked) {
+        // simply uncheck cloud (no need for confirmation since user explicitly chose Safe-only)
+        useCloud.checked = false;
+        await chrome.storage.local.set({ useCloudLookup: false });
+        apiKeyInput.disabled = false;
+      }
+      await chrome.storage.local.set({ useSafeBrowsingOnly: true });
+    } else {
+      await chrome.storage.local.set({ useSafeBrowsingOnly: false });
+    }
+    updateModeNotice();
+    updateSafeOnlyWarning();
+  });
+
+  // API key input: when user pastes a key, disable cloud lookup after confirmation if cloud is active.
   apiKeyInput.addEventListener('input', async () => {
     const key = apiKeyInput.value.trim();
     if (key) {
-      // If cloud is currently enabled, prompt user before disabling cloud and saving key
       const cloudState = (await chrome.storage.local.get(['useCloudLookup'])).useCloudLookup;
       if (cloudState) {
         const ok = confirm('Providing a direct API key will disable cloud lookup (proxy). Proceed and disable cloud lookup?');
         if (!ok) {
-          // revert input to empty to avoid accidental overwrite
           apiKeyInput.value = '';
           return;
         }
@@ -118,8 +161,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       // Save key and ensure cloud is disabled
       await chrome.storage.local.set({ directApiKey: key, useDirectLookup: true, useCloudLookup: false });
       useCloud.checked = false;
-      useCloud.disabled = false; // keep control interactive (user can still toggle and will be prompted)
-      strictSafeOnly.disabled = false;
+      apiKeyInput.disabled = false;
       mutualNote.textContent = 'Direct API key present — cloud lookup disabled.';
     } else {
       // cleared key -> remove direct lookup and re-enable cloud checkbox
@@ -127,44 +169,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       useCloud.disabled = false;
       mutualNote.textContent = 'No API key — cloud lookup may be enabled.';
     }
+    updateModeNotice();
     updateSafeOnlyWarning();
-  });
-
-  useSafeOnly.addEventListener('change', () => {
-    chrome.storage.local.set({ useSafeBrowsingOnly: useSafeOnly.checked });
-    // If user turned off Safe-only, nothing else should remain disabled by default.
-    // Recompute mutual note/UI state based on whether a key exists
-    const hasKey = !!apiKeyInput.value.trim();
-    apiKeyInput.disabled = useCloud.checked;
-    useCloud.disabled = !!apiKeyInput.value.trim(); // cloud disabled if key present, but user can still click to be prompted
-    updateSafeOnlyWarning();
-  });
-
-  strictSafeOnly.addEventListener('change', async () => {
-    const val = strictSafeOnly.checked;
-    const hasKey = !!apiKeyInput.value.trim();
-    if (val && !hasKey) {
-      alert('Strict Google-only requires a Safe Browsing API key. Please paste a key before enabling.');
-      strictSafeOnly.checked = false;
-      return;
-    }
-    // If strict enabled, ensure cloud disabled (and inform user)
-    if (val) {
-      await chrome.storage.local.set({ useSafeBrowsingOnlyStrict: true, useCloudLookup: false });
-      useCloud.checked = false;
-      useCloud.disabled = true;
-      mutualNote.textContent = 'Strict Google-only requires direct API and disables cloud lookup.';
-    } else {
-      await chrome.storage.local.set({ useSafeBrowsingOnlyStrict: false });
-      // re-evaluate whether cloud checkbox should be enabled (depends on API presence)
-      useCloud.disabled = !!apiKeyInput.value.trim();
-      mutualNote.textContent = 'Safe-only strict disabled.';
-    }
-    updateSafeOnlyWarning();
-  });
-
-  preferGoogleFirst.addEventListener('change', () => {
-    chrome.storage.local.set({ preferGoogleFirst: preferGoogleFirst.checked });
   });
 
   refreshFeeds.addEventListener('click', async () => {
@@ -216,12 +222,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
-  function updateSafeOnlyWarning() {
+  // updateSafeOnlyWarning is async so it can check storage/cloud status
+  async function updateSafeOnlyWarning() {
     const hasKey = !!apiKeyInput.value.trim();
-    if (useSafeOnly.checked && strictSafeOnly.checked && !hasKey) {
+    const s = await chrome.storage.local.get('useCloudLookup');
+    const cloud = !!s.useCloudLookup;
+    if (useSafeOnly.checked && !hasKey && !cloud) {
       safeOnlyWarning.style.display = 'block';
     } else {
       safeOnlyWarning.style.display = 'none';
     }
   }
+
 });

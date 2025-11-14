@@ -19,6 +19,7 @@
     .warning{color:#b45309;font-size:12px;margin-top:8px}
     #secondaryControls.disabled{opacity:0.6;pointer-events:none}
     .mutual-note{font-size:12px;color:var(--muted);margin-top:6px}
+    .inline-notice { font-size:12px; color: #0b5cff; margin-top:6px; }
   </style>
 </head>
 <body>
@@ -36,12 +37,14 @@
 
   <div class="card">
     <div id="secondaryControls">
-      <div style="margin-top:6px"><label><input id="useCloud" type="checkbox"> Use cloud lookup (Safe Browsing proxy)</label></div>
+      <div style="margin-top:6px">
+        <label><input id="useCloud" type="checkbox"> Use cloud lookup (Safe Browsing proxy)</label>
+      </div>
       <div class="small">Proxy: <code>http://localhost:3000</code></div>
 
       <div style="margin-top:8px">
         <label><input id="useSafeOnly" type="checkbox"> Use Google Safe Browsing only (skip local DB for navigations)</label>
-        <div class="small">When enabled, navigations will prefer Google Safe Browsing. Provide an API key below to call Google directly (strict mode disables proxy fallback).</div>
+        <div class="small">When enabled, navigations will prefer Google Safe Browsing. Provide an API key below to call Google directly.</div>
       </div>
 
       <div class="field-row">
@@ -50,25 +53,17 @@
       </div>
 
       <div class="mutual-note" id="mutualNote">
-        Note: Cloud lookup and direct API are mutually exclusive. Enabling one will disable the other.
+        Note: Cloud lookup and direct API are mutually exclusive — selecting one will deselect the other.
       </div>
 
-      <div style="margin-top:8px">
-        <label><input id="strictSafeOnly" type="checkbox"> Strict Google-only (no proxy fallback)</label>
-        <div class="small">When checked, Safe-only requires a direct API key and will NOT call the proxy.</div>
-      </div>
-
-      <div style="margin-top:8px">
-        <label><input id="preferGoogleFirst" type="checkbox"> Call Google first (even if heuristics match)</label>
-        <div class="small">When checked, navigations will query Safe Browsing before heuristics.</div>
-      </div>
+      <div class="inline-notice" id="modeNotice" style="display:none"></div>
 
       <div class="controls">
         <button id="reportBtn" class="btn-muted">Report current site</button>
         <button id="refreshFeeds" class="btn-muted">Refresh feeds</button>
       </div>
 
-      <div id="safeOnlyWarning" class="warning" style="display:none">Strict Safe-only requires a Safe Browsing API key. Please paste a key above.</div>
+      <div id="safeOnlyWarning" class="warning" style="display:none">Safe-only without a key may fall back to heuristics if no cloud is available.</div>
     </div>
   </div>
 
