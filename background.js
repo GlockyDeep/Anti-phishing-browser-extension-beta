@@ -1,23 +1,37 @@
-// background.js - Direct Google Safe Browsing checks (API key stored in extension)
-// Replaces navigation decision logic to call Google Safe Browsing for each top-frame navigation.
-// WARNING: Storing API key in the extension is insecure. Use only for local/dev testing.
+// background.js - Direct Google Safe Browsing with hover analysis
+// Replaces existing background.js. Adds CHECK_HOST_HOVER handling for content-script hover checks.
+// WARNING: Keeps the API key in extension storage (directApiKey) — only for local testing.
 
 const SAFE_BROWSING_ENDPOINT = 'https://safebrowsing.googleapis.com/v4/threatMatches:find?key=';
-const HOST_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
-const HOVER_CACHE_TTL_MS = 5 * 60 * 1000;  // preserved if needed
+const HOST_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour for host cache
+const HOVER_CACHE_TTL_MS = 5 * 60 * 1000; // short TTL for hover results
 const persistedHostCacheKey = 'hostCheckCache';
+
+
+const SAFE_DOMAIN_WHITELIST = [
+  'google.com',
+  'www.google.com',
+  'youtube.com',
+  'www.youtube.com',
+  'play.google.com',
+  'store.google.com',
+  'gmail.com',
+  'maps.google.com'
+  // add other trusted domains you use frequently
+];
+
 
 // Runtime state
 let blocklist = []; // packaged blocklist (normalized hosts)
 const hostCache = new Map(); // host -> { safe: bool, reason, ts, source }
-const hoverCache = new Map();
+const hoverCache = new Map(); // host -> { classification, reason, source, ts, raw }
 let cfg = { directApiKey: '', enabled: true };
 
 // Logging helpers
 function logSW(...args) { console.log('[Anti-Phish Guard SW]', ...args); }
 function warnSW(...args) { console.warn('[Anti-Phish Guard SW]', ...args); }
 
-// Normalize host and URL helpers
+// Normalize helpers
 const normalizeHost = h => (h || '').toString().trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '').replace(/^www\./, '');
 function normalizeUrl(u) {
   try {
@@ -29,7 +43,7 @@ function normalizeUrl(u) {
   }
 }
 
-// Safe chrome.tabs.update wrapper
+// Safe chrome.tabs.update wrapper (keeps SW stable)
 async function safeUpdateTab(tabId, updateProps) {
   if (typeof chrome === 'undefined' || !chrome.tabs || typeof chrome.tabs.update !== 'function') {
     warnSW('safeUpdateTab: chrome.tabs.update unavailable');
@@ -56,7 +70,7 @@ async function safeUpdateTab(tabId, updateProps) {
   });
 }
 
-// Persist / load host cache (debounced)
+// Persist / load host cache
 let persistTimer = null;
 function persistHostCacheDebounced() {
   if (persistTimer) clearTimeout(persistTimer);
@@ -106,30 +120,43 @@ function getHostCacheEntry(host) {
   return ent;
 }
 
-// Load packaged blocklist.json (if present)
+// Load packaged blocklist.json and normalize entries
 async function loadPackagedBlocklist() {
   try {
     const url = chrome.runtime.getURL('blocklist.json');
     const r = await fetch(url);
-    if (!r.ok) { blocklist = []; logSW('no packaged blocklist'); return; }
+    if (!r.ok) {
+      blocklist = [];
+      logSW('No packaged blocklist found (fetch non-OK)', r.status);
+      return;
+    }
     const raw = await r.json();
-    if (!Array.isArray(raw)) { blocklist = []; warnSW('blocklist not array'); return; }
+    if (!Array.isArray(raw)) {
+      blocklist = [];
+      warnSW('packaged blocklist is not an array');
+      return;
+    }
+    // Normalize entries: extract host if a URL, strip www, lowercase
     blocklist = raw.map(x => {
       try {
         let s = (x || '').toString().trim().toLowerCase();
+        // if the entry looks like a URL, extract hostname
         if (s.startsWith('http://') || s.startsWith('https://')) {
-          try { return new URL(s).hostname.replace(/^www\./, ''); } catch (_) {}
+          try {
+            return new URL(s).hostname.replace(/^www\./, '');
+          } catch (_) { /* fall back */ }
         }
+        // strip path, strip www
         s = s.replace(/^https?:\/\//, '').replace(/\/.*$/, '').replace(/^www\./, '');
         return s;
       } catch (e) {
         return '';
       }
     }).filter(Boolean);
-    logSW('blocklist loaded entries=', blocklist.length);
+    logSW('blocklist loaded, entries=', blocklist.length);
   } catch (e) {
     blocklist = [];
-    warnSW('loadPackagedBlocklist failed', e);
+    warnSW('failed to load packaged blocklist.json', e);
   }
 }
 
@@ -156,7 +183,6 @@ async function callSafeBrowsingDirect(apiKey, url) {
       return { error: 'sb-nonok', status: resp.status, body: text };
     }
     const j = await resp.json();
-    // If j.matches exists and non-empty -> threat matched
     const match = !!(j && j.matches && j.matches.length > 0);
     return { match, raw: j };
   } catch (e) {
@@ -164,7 +190,61 @@ async function callSafeBrowsingDirect(apiKey, url) {
   }
 }
 
-// Message handler: check arbitrary URL via GSB (useful for content-script requests)
+// Adult content heuristic (keyword-based) — used only for labeling
+function detectAdultContent(url) {
+  try {
+    const u = new URL(url);
+    const host = (u.hostname || '').toLowerCase();
+
+    // If host is on the explicit safe whitelist, do not classify as adult.
+    for (const safe of SAFE_DOMAIN_WHITELIST) {
+      if (host === safe || host.endsWith('.' + safe)) {
+        return false;
+      }
+    }
+
+    // If TLD is .xxx, treat as adult.
+    const tld = host.split('.').slice(-1)[0];
+    if (tld === 'xxx') return true;
+
+    // Conservative keyword set (only longer, specific words or high-precision short tokens)
+    const keywords = new Set([
+      'porn', 'xxx', 'adult', 'sex', 'fetish', 'escort', 'hentai', 'erotic', 'pornhub',
+      'xnxx', 'xvideos', 'sexvideos', 'nsfw', 'camgirl', 'cams'
+    ]);
+
+    // Tokenize path and search/query string on non-alphanumeric separators
+    const path = (u.pathname || '').toLowerCase();
+    const query = (u.search || '').toLowerCase();
+
+    function tokenize(s) {
+      return s.split(/[^a-z0-9]+/).filter(Boolean);
+    }
+
+    const pathTokens = tokenize(path);
+    const queryTokens = tokenize(query);
+
+    // Check tokens for exact keyword matches (conservative)
+    for (const t of pathTokens) {
+      if (keywords.has(t)) return true;
+    }
+    for (const t of queryTokens) {
+      if (keywords.has(t)) return true;
+    }
+
+    // Also check filename token (last segment) for keywords
+    const lastSeg = path.split('/').filter(Boolean).slice(-1)[0] || '';
+    if (lastSeg && keywords.has(lastSeg.toLowerCase())) return true;
+
+    // No matches
+    return false;
+  } catch (e) {
+    // On parse error, be conservative and return false (not adult)
+    return false;
+  }
+}
+
+// Message handlers: add hover analysis and direct-safe-browsing check
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || !msg.type) return;
   (async () => {
@@ -172,100 +252,122 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (msg.type === 'CHECK_URL_SAFE_BROWSING') {
         const url = (msg.url || '').toString();
         if (!url) { sendResponse({ error: 'no-url' }); return; }
-        const apiKey = (await chrome.storage.local.get('directApiKey')).directApiKey || '';
+        const kobj = await chrome.storage.local.get('directApiKey');
+        const apiKey = kobj && kobj.directApiKey ? kobj.directApiKey : '';
         if (!apiKey) { sendResponse({ error: 'no-api-key' }); return; }
         const sb = await callSafeBrowsingDirect(apiKey, url);
         if (sb.error) sendResponse({ error: sb.error, raw: sb });
         else if (sb.match) sendResponse({ safe: false, reason: 'Google Safe Browsing match', raw: sb.raw });
         else sendResponse({ safe: true, reason: 'No match', raw: sb.raw });
         return;
-      }
-    } catch (e) {
-      try { sendResponse({ error: String(e) }); } catch (_) {}
-      return;
-    }
-  })();
-  return true;
-});
-
-// onBeforeNavigate: check every top-frame navigation with GSB (direct)
-chrome.webNavigation.onBeforeNavigate.addListener((details) => {
-  (async () => {
-    try {
-      if (!details || details.frameId !== 0 || !details.url) return;
-      // skip if extension disabled
-      const s0 = await chrome.storage.local.get(['enabled']);
-      if (s0.enabled === false) return;
-
-      const urlStr = details.url;
-      const tabId = details.tabId;
-      const u = new URL(urlStr);
-      const hostOnly = normalizeHost(u.hostname);
-
-      // allowlist override
-      const s = await chrome.storage.local.get('allowlist');
-      const allowlist = s && s.allowlist ? s.allowlist.map(normalizeHost) : [];
-      if (allowlist.includes(hostOnly)) {
-        logSW('allowlist', hostOnly);
-        return;
-      }
-
-      // packaged blocklist precedence
-      if (blocklist.includes(hostOnly)) {
-        const reason = 'Domain is on the packaged blocklist';
-        setHostCacheEntry(hostOnly, false, reason, 'local-blocklist');
-        logSW('blocked (local blocklist)', hostOnly);
-        await safeUpdateTab(tabId, { url: chrome.runtime.getURL('warning.html') + `?url=${encodeURIComponent(urlStr)}&reason=${encodeURIComponent(reason)}&source=local-blocklist` });
-        return;
-      }
-
-      // host cache short-circuit
-      const cached = getHostCacheEntry(hostOnly);
-      if (cached) {
-        logSW('hostCache hit', hostOnly, cached);
-        if (!cached.safe) {
-          await safeUpdateTab(tabId, { url: chrome.runtime.getURL('warning.html') + `?url=${encodeURIComponent(urlStr)}&reason=${encodeURIComponent(cached.reason)}&source=${encodeURIComponent(cached.source)}` });
-          return;
-        } else {
-          return; // safe cached
+      } else if (msg.type === 'CHECK_HOST_HOVER') {
+        // msg.href is the hovered URL from content script (may be relative)
+        const href = (msg.href || '').toString();
+        if (!href) { sendResponse({ classification: 'unknown', reason: 'no-href' }); return; }
+        // resolve URL relative to page if sender.tab exists (content script should send absolute)
+        let finalUrl = href;
+        try {
+          finalUrl = new URL(href, 'https://example.invalid').toString();
+        } catch (_) {
+          // fallback
+          finalUrl = href;
         }
-      }
+        // try to parse to get host
+        let host = null;
+        try { host = new URL(finalUrl).hostname; } catch (_) { host = null; }
+        const hostOnly = normalizeHost(host);
 
-      // Get API key from storage
-      const kobj = await chrome.storage.local.get('directApiKey');
-      const apiKey = kobj && kobj.directApiKey ? kobj.directApiKey : '';
-      if (!apiKey) {
-        // no API key configured -> allow (or you could choose to block)
-        logSW('no directApiKey configured, allowing navigation for', hostOnly);
-        setHostCacheEntry(hostOnly, true, '', 'no-api-key');
+        // 1) allowlist
+        const st = await chrome.storage.local.get('allowlist');
+        const allowlist = st && st.allowlist ? st.allowlist.map(normalizeHost) : [];
+        if (allowlist.includes(hostOnly)) {
+          sendResponse({ classification: 'safe', reason: 'allowlist', source: 'allowlist' });
+          return;
+        }
+
+        // 2) packaged blocklist
+        if (blocklist.includes(hostOnly)) {
+          sendResponse({ classification: 'unsafe', reason: 'packaged blocklist', source: 'local-blocklist' });
+          return;
+        }
+
+        // 3) hover cache
+        const hc = hoverCache.get(hostOnly);
+        if (hc && (Date.now() - hc.ts) < HOVER_CACHE_TTL_MS) {
+          sendResponse({ classification: hc.classification, reason: hc.reason, source: hc.source, raw: hc.raw });
+          return;
+        }
+
+        // 4) hostCache short-circuit
+        const cached = getHostCacheEntry(hostOnly);
+        if (cached) {
+          if (!cached.safe) {
+            // host previously determined unsafe
+            const classification = 'unsafe';
+            const reason = cached.reason || 'hostCache';
+            sendResponse({ classification, reason, source: cached.source || 'hostCache' });
+            // persist hoverCache
+            hoverCache.set(hostOnly, { classification, reason, source: cached.source || 'hostCache', ts: Date.now(), raw: null });
+            return;
+          } else {
+            // safe cached host
+            const classification = 'safe';
+            const reason = cached.reason || 'hostCache';
+            hoverCache.set(hostOnly, { classification, reason, source: cached.source || 'hostCache', ts: Date.now(), raw: null });
+            sendResponse({ classification, reason, source: cached.source || 'hostCache' });
+            return;
+          }
+        }
+
+        // 5) If API key available, call GSB (host-level cache will be filled from navigation checks too)
+        const kobj2 = await chrome.storage.local.get('directApiKey');
+        const apiKey = kobj2 && kobj2.directApiKey ? kobj2.directApiKey : '';
+        if (apiKey) {
+          const sb = await callSafeBrowsingDirect(apiKey, finalUrl);
+          if (sb.error) {
+            // on error, fallback to adult heuristic or unknown
+            const isAdult = detectAdultContent(finalUrl);
+            const classification = isAdult ? 'adult' : 'unknown';
+            const reason = sb.error || 'gsb-error';
+            hoverCache.set(hostOnly, { classification, reason, source: 'gsb-error', ts: Date.now(), raw: sb });
+            sendResponse({ classification, reason, source: 'gsb-error', raw: sb });
+            return;
+          }
+          if (sb.match) {
+            const classification = 'unsafe';
+            const reason = 'Google Safe Browsing match';
+            hoverCache.set(hostOnly, { classification, reason, source: 'safebrowsing', ts: Date.now(), raw: sb.raw });
+            // also update hostCache as unsafe
+            setHostCacheEntry(hostOnly, false, reason, 'safebrowsing');
+            sendResponse({ classification, reason, source: 'safebrowsing', raw: sb.raw });
+            return;
+          } else {
+            // GSB says no match -> consider safe, but still detect adult
+            const isAdult = detectAdultContent(finalUrl);
+            const classification = isAdult ? 'adult' : 'safe';
+            const reason = isAdult ? 'adult-heuristic' : 'No Safe Browsing match';
+            hoverCache.set(hostOnly, { classification, reason, source: 'safebrowsing', ts: Date.now(), raw: sb.raw });
+            // update hostCache as safe
+            setHostCacheEntry(hostOnly, true, '', 'safebrowsing');
+            sendResponse({ classification, reason, source: 'safebrowsing', raw: sb.raw });
+            return;
+          }
+        }
+
+        // 6) No API key: fall back to adult heuristic or unknown
+        const isAdult = detectAdultContent(finalUrl);
+        const classification = isAdult ? 'adult' : 'unknown';
+        const reason = isAdult ? 'adult-heuristic' : 'no-api-key';
+        hoverCache.set(hostOnly, { classification, reason, source: 'no-api-key', ts: Date.now(), raw: null });
+        sendResponse({ classification, reason, source: 'no-api-key' });
         return;
       }
-
-      // Call Google Safe Browsing
-      const sb = await callSafeBrowsingDirect(apiKey, urlStr);
-      if (sb.error) {
-        // On error, do not block by default; mark safe to avoid repeated failing calls
-        warnSW('GSB error for', hostOnly, sb);
-        setHostCacheEntry(hostOnly, true, '', 'gsb-error');
-        return;
-      }
-
-      if (sb.match) {
-        const reason = 'Matches Google Safe Browsing';
-        setHostCacheEntry(hostOnly, false, reason, 'safebrowsing');
-        logSW('Blocked by Google Safe Browsing', hostOnly);
-        await safeUpdateTab(tabId, { url: chrome.runtime.getURL('warning.html') + `?url=${encodeURIComponent(urlStr)}&reason=${encodeURIComponent(reason)}&source=safebrowsing` });
-        return;
-      } else {
-        setHostCacheEntry(hostOnly, true, '', 'safebrowsing');
-        return;
-      }
-
     } catch (e) {
-      warnSW('onBeforeNavigate error', e);
+      try { sendResponse({ classification: 'unknown', reason: String(e) }); } catch (_) {}
       return;
     }
   })();
+  return true; // indicate async response
 });
 
 // storage change listener: capture directApiKey and enabled toggles
@@ -286,14 +388,15 @@ async function debugDump() {
   logSW('debugDump storage:', s);
   logSW('blocklist len:', blocklist.length);
   logSW('hostCache size:', hostCache.size);
-  return { storage: s, blocklistLen: blocklist.length, hostCacheSize: hostCache.size };
+  logSW('hoverCache size:', hoverCache.size);
+  return { storage: s, blocklistLen: blocklist.length, hostCacheSize: hostCache.size, hoverCacheSize: hoverCache.size };
 }
 self.debugDump = debugDump;
 
-// initialization
+// init
 (async function init() {
-  await loadPackagedBlocklist();
-  await loadPersistedHostCache();
+  await loadPackagedBlocklist().catch(() => {});
+  await loadPersistedHostCache().catch(() => {});
   const s = await chrome.storage.local.get(['directApiKey','enabled']);
   cfg.directApiKey = s.directApiKey || '';
   cfg.enabled = s.enabled !== undefined ? s.enabled : true;
