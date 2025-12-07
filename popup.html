@@ -4,72 +4,52 @@
   <meta charset="utf-8" />
   <title>Anti-Phish Guard</title>
   <style>
-    :root { --bg:#fff; --muted:#6b7280; --accent:#0b5cff; --danger:#d9534f; --card:#f8fafc; --border:#e6e6e6; --radius:8px; }
-    body{background:var(--bg);color:#111827;width:380px;margin:0;padding:12px;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;}
-    header{display:flex;gap:10px;align-items:center}
-    h3{margin:0;font-size:16px}
-    .card{background:var(--card);padding:10px;border:1px solid var(--border);border-radius:8px;margin-top:10px}
-    label{display:flex;align-items:center;gap:8px}
-    .small{font-size:12px;color:var(--muted);margin-top:6px}
-    .field-row{display:flex;gap:8px;align-items:center;margin-top:8px}
-    .api-input{flex:1;padding:8px;border-radius:6px;border:1px solid var(--border);font-family:monospace}
-    .controls{display:flex;gap:8px;margin-top:12px}
-    button{padding:8px 10px;border-radius:6px;border:none;cursor:pointer}
-    .btn-muted{background:#f0f2f7}
-    .warning{color:#b45309;font-size:12px;margin-top:8px}
-    #secondaryControls.disabled{opacity:0.6;pointer-events:none}
-    .mutual-note{font-size:12px;color:var(--muted);margin-top:6px}
-    .inline-notice { font-size:12px; color: #0b5cff; margin-top:6px; }
+    body { font-family: Arial, sans-serif; width: 340px; padding: 12px; }
+    label { display: block; margin-top: 8px; }
+    input[type="text"] { width: 100%; box-sizing: border-box; padding: 6px; }
+    .row { display:flex; align-items:center; gap:8px; margin-top:8px; }
+    #status { color: #2c7; margin-left: 8px; }
+    #allowlist { margin-top: 12px; font-size: 13px; }
+    .allow-row { display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid #eee; }
+    button { padding:6px 8px; cursor: pointer; }
+    .btn-muted { background: #eee; border: 1px solid #ddd; }
+    #testResult { margin-top: 10px; padding: 8px; border-radius: 4px; font-size: 13px; display: none; }
+    #testResult.ok { background: #e6ffed; color: #064; border: 1px solid #b7f1c7; }
+    #testResult.bad { background: #ffecec; color: #900; border: 1px solid #f3b1b1; }
+    #testResult.info { background: #eef6ff; color: #044; border: 1px solid #cfe3ff; }
+    .small { font-size: 12px; color: #666; margin-top:6px; }
   </style>
 </head>
 <body>
-  <header>
-    <img src="icons/icon48.svg" width="28" height="28" alt="">
-    <div>
-      <h3>Anti-Phish Guard</h3>
-      <div class="small">Pre-visit phishing protection</div>
-    </div>
-  </header>
+  <h3>Anti-Phish Guard</h3>
 
-  <div style="margin-top:10px">
-    <label><input id="toggle" type="checkbox"> Enabled</label>
+  <label>
+    <input type="checkbox" id="enabled" />
+    Enabled
+  </label>
+
+  <label for="apiKey">Google Safe Browsing API key (for testing)</label>
+  <input type="text" id="apiKey" placeholder="Paste API key here" autocomplete="off" />
+
+  <div class="row">
+    <button id="saveBtn">Save</button>
+    <button id="testKeyBtn">Test key on active tab</button>
+    <span id="status"></span>
   </div>
 
-  <div class="card">
-    <div id="secondaryControls">
-      <div style="margin-top:6px">
-        <label><input id="useCloud" type="checkbox"> Use cloud lookup (Safe Browsing proxy)</label>
-      </div>
-      <div class="small">Proxy: <code>http://localhost:3000</code></div>
+  <div id="testResult" role="status"></div>
 
-      <div style="margin-top:8px">
-        <label><input id="useSafeOnly" type="checkbox"> Use Google Safe Browsing only (skip local DB for navigations)</label>
-        <div class="small">When enabled, navigations will prefer Google Safe Browsing. Provide an API key below to call Google directly.</div>
-      </div>
-
-      <div class="field-row">
-        <div style="min-width:160px;font-size:13px;color:var(--muted)">Safe Browsing API key</div>
-        <input id="apiKey" class="api-input" type="password" placeholder="Paste API key (optional)">
-      </div>
-
-      <div class="mutual-note" id="mutualNote">
-        Note: Cloud lookup and direct API are mutually exclusive — selecting one will deselect the other.
-      </div>
-
-      <div class="inline-notice" id="modeNotice" style="display:none"></div>
-
-      <div class="controls">
-        <button id="reportBtn" class="btn-muted">Report current site</button>
-        <button id="refreshFeeds" class="btn-muted">Refresh feeds</button>
-      </div>
-
-      <div id="safeOnlyWarning" class="warning" style="display:none">Safe-only without a key may fall back to heuristics if no cloud is available.</div>
-    </div>
+  <div id="mutualNote" class="small">
+    Note: Storing the API key in the extension is insecure. Use only for local testing.
   </div>
 
-  <div style="margin-top:12px">
-    <strong>Allowlist</strong>
-    <div id="allowlist" style="font-size:12px;margin-top:6px;border:1px solid var(--border);padding:8px;border-radius:6px;max-height:120px;overflow:auto">(none)</div>
+  <div id="allowlist">
+    <h4 style="margin:12px 0 6px 0;">Allowlist</h4>
+    <div id="allowlistItems">(none)</div>
+    <div style="margin-top:8px;">
+      <input type="text" id="allowInput" placeholder="example.com" style="width:70%;" />
+      <button id="addAllowBtn" class="btn-muted">Add</button>
+    </div>
   </div>
 
   <script src="popup.js"></script>
